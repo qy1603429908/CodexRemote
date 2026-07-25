@@ -1,4 +1,5 @@
 import type { IncomingMessage } from "node:http";
+import { isAbsolute } from "node:path";
 import type { Duplex } from "node:stream";
 import { WebSocket, WebSocketServer } from "ws";
 import {
@@ -69,6 +70,8 @@ class GatewayRequestError extends Error {
 
 const TURN_SUBMISSION_TTL_MS = 10 * 60_000;
 const MAX_TURN_SUBMISSIONS = 1_000;
+const EMPTY_THREAD_INDEX_TTL_MS = 5_000;
+const THREAD_INDEX_TTL_MS = 60_000;
 const THREAD_SOURCE_KINDS = [
   "cli", "vscode", "exec", "appServer", "subAgent", "subAgentReview",
   "subAgentCompact", "subAgentThreadSpawn", "subAgentOther", "unknown",
@@ -95,6 +98,7 @@ export class MobileGateway {
   private readonly threadIndex = new ThreadIndexStore();
   private readonly socketThreads = new WeakMap<WebSocket, Set<string>>();
   private threadIndexLoad: Promise<void> | null = null;
+  private threadIndexLoadedAt = 0;
 
   constructor(
     private readonly bridge: AppServerBridge,
@@ -108,9 +112,10 @@ export class MobileGateway {
       handleProtocols: selectedProtocol,
     });
     this.wss.on("connection", (socket) => this.onConnection(socket));
-    bridge.on("ready", () =>
-      this.broadcast({ type: "status", codexReady: true }),
-    );
+    bridge.on("ready", () => {
+      this.threadIndexLoadedAt = 0;
+      this.broadcast({ type: "status", codexReady: true });
+    });
     bridge.on("offline", (error: Error) => {
       for (const requestId of this.approvals.keys()) {
         this.broadcast({
@@ -225,7 +230,7 @@ export class MobileGateway {
         }
         if (wasDesktopActive && !this.isThreadActive(id)) void this.refreshThreadDiff(id, true);
       }
-      if (typeof thread.cwd === "string" && thread.cwd.startsWith("/")) this.threadCwds.set(id, thread.cwd);
+      if (typeof thread.cwd === "string" && isAbsoluteHostPath(thread.cwd)) this.threadCwds.set(id, thread.cwd);
       this.upsertThreadSummary({ ...toThreadSummary(thread), status: this.mergedThreadStatus(id, thread.threadRuntimeStatus ?? thread.status) });
       this.syncDesktopApprovals(id, thread);
       const liveThread = projectDesktopLiveThread(this.projectThreadRuntimeStatus(thread));
@@ -994,7 +999,12 @@ export class MobileGateway {
   }
 
   private async ensureThreadIndex(): Promise<void> {
-    if (this.threadIndex.isInitialized) return;
+    if (this.threadIndex.isInitialized) {
+      const ttl = this.threadIndex.snapshot().length === 0
+        ? EMPTY_THREAD_INDEX_TTL_MS
+        : THREAD_INDEX_TTL_MS;
+      if (Date.now() - this.threadIndexLoadedAt < ttl) return;
+    }
     if (this.threadIndexLoad) return this.threadIndexLoad;
     this.threadIndexLoad = (async () => {
       const data: Array<Record<string, unknown>> = [];
@@ -1023,8 +1033,9 @@ export class MobileGateway {
         ...thread,
         status: this.mergedThreadStatus(thread.id, thread.status),
       })));
+      this.threadIndexLoadedAt = Date.now();
       for (const thread of this.threadIndex.snapshot()) {
-        if (thread.cwd.startsWith("/")) this.threadCwds.set(thread.id, thread.cwd);
+        if (isAbsoluteHostPath(thread.cwd)) this.threadCwds.set(thread.id, thread.cwd);
       }
     })().finally(() => {
       this.threadIndexLoad = null;
@@ -1073,7 +1084,7 @@ export class MobileGateway {
 
   private upsertThreadSummary(summary: ThreadSummary): void {
     if (!summary.id) return;
-    if (summary.cwd.startsWith("/")) this.threadCwds.set(summary.id, summary.cwd);
+    if (isAbsoluteHostPath(summary.cwd)) this.threadCwds.set(summary.id, summary.cwd);
     const change = this.threadIndex.upsert(summary);
     if (!change) return;
     this.broadcast({
@@ -1118,7 +1129,9 @@ export class MobileGateway {
     knownTurnIds?: string[],
   ): Promise<void> {
     const limit = boundedHistoryLimit(requestedLimit);
-    const desktopThread = await this.desktopIpc?.openConversation(threadId, "local", 2_500, false);
+    const desktopThread = this.desktopIpc?.supported === false
+      ? null
+      : await this.desktopIpc?.openConversation(threadId, "local", 2_500, false);
     let metadataPayload: unknown;
     if (desktopThread && this.desktopIpc?.hasOwner(threadId)) {
       this.desktopThreads.set(threadId, desktopThread);
@@ -1204,7 +1217,7 @@ export class MobileGateway {
   private rememberThreadCwd(threadId: string, payload: unknown): void {
     const outer = asRecord(payload);
     const thread = asRecord(outer?.thread) ?? outer;
-    if (typeof thread?.cwd === "string" && thread.cwd.startsWith("/"))
+    if (typeof thread?.cwd === "string" && isAbsoluteHostPath(thread.cwd))
       this.threadCwds.set(threadId, thread.cwd);
   }
 
@@ -1219,7 +1232,7 @@ export class MobileGateway {
       typeof desktopCwd === "string"
         ? desktopCwd
         : this.threadCwds.get(threadId);
-    if (!cwd || !cwd.startsWith("/"))
+    if (!cwd || !isAbsoluteHostPath(cwd))
       throw new Error(
         "Task working directory is unavailable; refusing to widen workspace permissions.",
       );
@@ -1384,7 +1397,7 @@ export class MobileGateway {
 export function desktopAttachmentPaths(thread: Record<string, unknown>): string[] {
   const paths = new Set<string>();
   const add = (value: unknown) => {
-    if (typeof value === "string" && value.startsWith("/")) paths.add(value);
+    if (typeof value === "string" && isAbsoluteHostPath(value)) paths.add(value);
   };
   for (const turnValue of canonicalTurns(thread)) {
     const turn = asRecord(turnValue);
@@ -1559,9 +1572,13 @@ function requiredString(value: unknown, name: string): string {
   return value;
 }
 
+export function isAbsoluteHostPath(value: string): boolean {
+  return isAbsolute(value);
+}
+
 function requiredAbsolutePath(value: unknown, name: string): string {
   const text = requiredString(value, name);
-  if (!text.startsWith("/"))
+  if (!isAbsoluteHostPath(text))
     throw new Error(`${name} must be an absolute path.`);
   return text;
 }
@@ -1790,7 +1807,7 @@ function permissionSettings(
       approvalsReviewer: "user",
       sandboxPolicy: { type: "readOnly", networkAccess: false },
     };
-  if (!cwd || !cwd.startsWith("/"))
+  if (!cwd || !isAbsoluteHostPath(cwd))
     throw new Error(
       "A verified task working directory is required for workspace permissions.",
     );

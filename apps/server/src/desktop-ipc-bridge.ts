@@ -116,8 +116,12 @@ export class DesktopIpcBridge extends EventEmitter {
     return this.clientId !== null && this.socket?.writable === true;
   }
 
+  get supported(): boolean {
+    return this.enabled && process.platform !== "win32" && !this.disposed;
+  }
+
   async start(): Promise<void> {
-    if (!this.enabled || process.platform === "win32" || this.disposed) return;
+    if (!this.supported) return;
     if (!(await this.isSafeSocket())) {
       this.emit(
         "unavailable",

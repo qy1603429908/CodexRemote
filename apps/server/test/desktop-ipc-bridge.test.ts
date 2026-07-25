@@ -71,4 +71,9 @@ describe("Desktop IPC canonical history", () => {
     expect(isUncertainDesktopSubmissionError(new Error("active turn already ended"))).toBe(false);
   });
 
+  it("reports whether Desktop IPC is supported on the current host", () => {
+    expect(new DesktopIpcBridge(true).supported).toBe(process.platform !== "win32");
+    expect(new DesktopIpcBridge(false).supported).toBe(false);
+  });
+
 });

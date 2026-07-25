@@ -1,7 +1,8 @@
 import { access, chmod, writeFile } from "node:fs/promises";
 import { constants } from "node:fs";
 import { randomBytes } from "node:crypto";
-import { resolve } from "node:path";
+import { homedir } from "node:os";
+import { join, resolve } from "node:path";
 
 const envPath = resolve(process.cwd(), ".env");
 try {
@@ -19,6 +20,7 @@ const body = [
   `CMR_TOKEN=${token}`,
   "# CMR_ALLOWED_ORIGINS=capacitor://localhost,http://localhost",
   "# CODEX_BIN=/opt/homebrew/bin/codex",
+  `CODEX_HOME=${process.env.CODEX_HOME?.trim() || join(homedir(), ".codex")}`,
   "# Download allowlist, comma-separated. When unset, only the private upload directory is allowed.",
   "# CMR_FILE_ROOTS=/path/to/allowed/root,/another/allowed/root",
   "# CMR_UPLOAD_DIRECTORY=/path/to/private/uploads",

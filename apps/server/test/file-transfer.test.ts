@@ -63,7 +63,8 @@ describe("file transfer primitives", () => {
     expect(result.mimeType).toBe("text/markdown");
     expect(result.size).toBe(11);
     expect(await readFile(result.path, "utf8")).toBe("hello world");
-    expect((await stat(result.path)).mode & 0o777).toBe(0o600);
+    if (process.platform !== "win32")
+      expect((await stat(result.path)).mode & 0o777).toBe(0o600);
   });
 
   it("rejects oversized streams and removes their partial files", async () => {
@@ -75,7 +76,7 @@ describe("file transfer primitives", () => {
     expect(await readdir(uploads)).toEqual([]);
   });
 
-  it("only registers canonical regular files inside allowed roots, including symlink resolution", async () => {
+  it.skipIf(process.platform === "win32")("only registers canonical regular files inside allowed roots, including symlink resolution", async () => {
     const { root, manager } = await fixture();
     const outside = await mkdtemp(join(tmpdir(), "cmr-outside-"));
     temporaryDirectories.push(outside);
@@ -135,7 +136,7 @@ describe("file transfer primitives", () => {
     await expect(readFile(upload.path)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
-  it("requires upload storage to remain inside an allowed root after symlink resolution", async () => {
+  it.skipIf(process.platform === "win32")("requires upload storage to remain inside an allowed root after symlink resolution", async () => {
     const root = await mkdtemp(join(tmpdir(), "cmr-root-"));
     const outside = await mkdtemp(join(tmpdir(), "cmr-storage-outside-"));
     temporaryDirectories.push(root, outside);

@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import WebSocket from "ws";
-import { MobileGateway, desktopAttachmentPaths, projectDesktopLiveThread } from "../src/gateway.js";
+import { MobileGateway, desktopAttachmentPaths, isAbsoluteHostPath, projectDesktopLiveThread } from "../src/gateway.js";
 import type { ServerConfig } from "../src/config.js";
 import { PromptQueueStore } from "../src/prompt-queue.js";
 
@@ -48,13 +48,14 @@ class FakeBridge extends EventEmitter {
   ready = true;
   calls: Array<{ method: string; params: unknown }> = [];
   responses: Array<{ id: string | number; result: unknown }> = [];
+  threadListData: Array<Record<string, unknown>> = [
+    { id: "thread-1", name: "Test", preview: "Hello", cwd: "/tmp", modelProvider: "custom", updatedAt: 1, status: { type: "notLoaded" }, parentThreadId: null, agentNickname: null, agentRole: null, source: "appServer" },
+    { id: "agent-1", name: "Agent", preview: "Review", cwd: "/tmp", modelProvider: "custom", updatedAt: 2, status: { type: "notLoaded" }, source: { subAgent: { thread_spawn: { parent_thread_id: "thread-1", agent_nickname: "Meitner", agent_role: "reviewer" } } } },
+  ];
   async request(method: string, params: unknown): Promise<unknown> {
     this.calls.push({ method, params });
     if (method === "thread/list") {
-      return { data: [
-        { id: "thread-1", name: "Test", preview: "Hello", cwd: "/tmp", modelProvider: "custom", updatedAt: 1, status: { type: "notLoaded" }, parentThreadId: null, agentNickname: null, agentRole: null, source: "appServer" },
-        { id: "agent-1", name: "Agent", preview: "Review", cwd: "/tmp", modelProvider: "custom", updatedAt: 2, status: { type: "notLoaded" }, source: { subAgent: { thread_spawn: { parent_thread_id: "thread-1", agent_nickname: "Meitner", agent_role: "reviewer" } } } },
-      ], nextCursor: null };
+      return { data: this.threadListData, nextCursor: null };
     }
     if (method === "thread/resume") {
       return { thread: { id: "thread-1", name: "Test", cwd: "/tmp", turns: [] } };
@@ -103,6 +104,7 @@ const config: ServerConfig = {
   tokenDigest: createHash("sha256").update(token).digest(),
   allowedOrigins: new Set(["capacitor://localhost"]),
   codexBin: "codex",
+  codexHome: "/tmp/.codex",
   serverId: "test-server",
   desktopIpc: true,
   fileRoots: ["/tmp"],
@@ -137,6 +139,24 @@ async function waitFor(predicate: () => boolean, timeoutMs = 1_000): Promise<voi
 }
 
 
+
+describe("Host path validation", () => {
+  it("accepts absolute paths for the current Server platform", () => {
+    if (process.platform === "win32") {
+      expect(isAbsoluteHostPath("C:\\Users\\alice\\project")).toBe(true);
+      expect(isAbsoluteHostPath("\\\\server\\share\\project")).toBe(true);
+    } else {
+      expect(isAbsoluteHostPath("/tmp/project")).toBe(true);
+      expect(isAbsoluteHostPath("C:\\Users\\alice\\project")).toBe(false);
+    }
+  });
+
+  it("rejects relative and drive-relative paths", () => {
+    expect(isAbsoluteHostPath("project/file.txt")).toBe(false);
+    expect(isAbsoluteHostPath("C:project\\file.txt")).toBe(false);
+  });
+});
+
 describe("Desktop attachment extraction", () => {
   it("trusts only canonical user attachment fields, not arbitrary tool output paths", () => {
     expect(desktopAttachmentPaths({
@@ -145,6 +165,15 @@ describe("Desktop attachment extraction", () => {
         { type: "commandExecution", output: "/etc/passwd", path: "/etc/passwd" },
       ] }],
     })).toEqual(["/tmp/screen.png"]);
+  });
+
+  it.skipIf(process.platform !== "win32")("accepts canonical Windows attachment paths", () => {
+    expect(desktopAttachmentPaths({
+      turns: [{ items: [{
+        type: "steeringUserMessage",
+        attachments: [{ fsPath: "C:\\Users\\alice\\screen.png" }],
+      }] }],
+    })).toEqual(["C:\\Users\\alice\\screen.png"]);
   });
 });
 
@@ -165,6 +194,38 @@ describe("MobileGateway", () => {
     expect(threads.find((thread) => thread.id === "agent-1")).toMatchObject({ parentThreadId: "thread-1", agentNickname: "Meitner" });
     const listCall = bridge.calls.find((call) => call.method === "thread/list");
     expect(listCall?.params).toMatchObject({ sourceKinds: expect.arrayContaining(["appServer", "subAgent", "subAgentThreadSpawn"]) });
+    ws.close();
+  });
+
+
+
+  it("refreshes an initially empty thread index after app-server reconnects", async () => {
+    const { bridge, port } = await start();
+    bridge.threadListData = [];
+    const encoded = Buffer.from(token).toString("base64url");
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`, ["codex-mobile-v1", `token.${encoded}`], { origin: "capacitor://localhost" });
+    const messages: Array<Record<string, unknown>> = [];
+    ws.on("message", (data) => messages.push(JSON.parse(data.toString())));
+    await new Promise<void>((resolve, reject) => { ws.once("open", resolve); ws.once("error", reject); });
+
+    ws.send(JSON.stringify({ type: "threads.sync", requestId: "empty-index" }));
+    await waitFor(() => messages.some((message) => message.type === "threads.snapshot" && message.requestId === "empty-index"));
+    expect((messages.find((message) => message.requestId === "empty-index")?.threads as unknown[])).toHaveLength(0);
+
+    bridge.threadListData = [{
+      id: "windows-thread",
+      name: "Windows task",
+      preview: "Recovered",
+      cwd: process.platform === "win32" ? "C:\\Users\\alice\\project" : "/tmp/project",
+      modelProvider: "custom",
+      updatedAt: 3,
+      status: { type: "notLoaded" },
+      source: "appServer",
+    }];
+    bridge.emit("ready");
+    ws.send(JSON.stringify({ type: "threads.sync", requestId: "recovered-index" }));
+    await waitFor(() => messages.some((message) => message.type === "threads.snapshot" && message.requestId === "recovered-index"));
+    expect((messages.find((message) => message.requestId === "recovered-index")?.threads as Array<{ id: string }>)).toMatchObject([{ id: "windows-thread" }]);
     ws.close();
   });
 
