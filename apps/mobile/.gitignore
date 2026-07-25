@@ -1,0 +1,9 @@
+node_modules/
+dist/
+artifacts/
+*.log
+.DS_Store
+android/.gradle/
+android/local.properties
+android/app/build/
+android/build/

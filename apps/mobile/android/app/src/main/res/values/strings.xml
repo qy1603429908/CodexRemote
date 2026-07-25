@@ -1,0 +1,19 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Codex Remote</string>
+    <string name="title_activity_main">Codex Remote</string>
+    <string name="package_name">dev.codexmobile.remote</string>
+    <string name="custom_url_scheme">dev.codexmobile.remote</string>
+    <string name="notification_channel_background">Background connection</string>
+    <string name="notification_channel_background_description">Keeps the authenticated Codex remote connection available while the app is in the background.</string>
+    <string name="notification_channel_approvals">Approvals</string>
+    <string name="notification_channel_approvals_description">Urgent requests that require a decision for a Codex task.</string>
+    <string name="notification_channel_completions">Task completion</string>
+    <string name="notification_channel_completions_description">Notifications when a Codex task finishes.</string>
+    <string name="background_notification_title">Codex Remote is connected</string>
+    <string name="background_notification_text">Monitoring tasks and approval requests.</string>
+    <string name="approval_notification_title">Codex needs approval</string>
+    <string name="approval_notification_text">Open the task to review the request.</string>
+    <string name="completion_notification_title">Codex task completed</string>
+    <string name="completion_notification_text">Open the task to view the result.</string>
+</resources>
