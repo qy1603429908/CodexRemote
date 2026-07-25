@@ -13,7 +13,10 @@ const bridge = new AppServerBridge({
   env: buildCodexEnvironment(config.codexHome),
   expectedCodexHome: config.codexHome,
 });
-const desktopIpc = new DesktopIpcBridge(config.desktopIpc);
+const desktopIpc = new DesktopIpcBridge(
+  config.desktopIpc,
+  config.desktopIpcEndpoint,
+);
 const promptQueue = await PromptQueueStore.create(config.promptQueueFile);
 const files = await FileTransferManager.create({ allowedRoots: config.fileRoots, uploadDirectory: config.uploadDirectory });
 await files.cleanupOrphanedUploads(promptQueue.protectedFilePaths());
@@ -30,7 +33,14 @@ async function handleHttp(request: IncomingMessage, response: ServerResponse): P
       "content-type": "application/json; charset=utf-8",
       "cache-control": "no-store",
     });
-    response.end(JSON.stringify({ ok: bridge.ready, service: "codex-mobile-remote", version: "0.3.2", desktopIpc: desktopIpc.ready }));
+    response.end(JSON.stringify({
+      ok: bridge.ready,
+      service: "codex-mobile-remote",
+      version: "0.3.2",
+      desktopIpc: desktopIpc.ready,
+      desktopIpcSupported: desktopIpc.supported,
+      desktopIpcReady: desktopIpc.ready,
+    }));
     return;
   }
 

@@ -34,4 +34,12 @@ describe("loadConfig", () => {
     });
   });
 
+  it("allows a validated platform-specific Desktop IPC endpoint override", () => {
+    const config = loadConfig({
+      CMR_TOKEN: "a".repeat(32),
+      CMR_DESKTOP_IPC_ENDPOINT: "\\\\.\\pipe\\codex-ipc-test",
+    });
+    expect(config.desktopIpcEndpoint).toBe("\\\\.\\pipe\\codex-ipc-test");
+  });
+
 });

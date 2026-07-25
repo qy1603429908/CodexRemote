@@ -12,6 +12,7 @@ export interface ServerConfig {
   codexHome: string;
   serverId: string;
   desktopIpc: boolean;
+  desktopIpcEndpoint?: string;
   fileRoots: string[];
   uploadDirectory: string;
   promptQueueFile: string;
@@ -60,6 +61,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     codexHome: env.CODEX_HOME?.trim() || join(homedir(), ".codex"),
     serverId: env.CMR_SERVER_ID ?? `${hostname()}-${randomUUID().slice(0, 8)}`,
     desktopIpc: env.CMR_DESKTOP_IPC !== "0",
+    desktopIpcEndpoint: env.CMR_DESKTOP_IPC_ENDPOINT?.trim() || undefined,
     fileRoots,
     uploadDirectory,
     promptQueueFile: env.CMR_PROMPT_QUEUE_FILE ?? join(stateDirectory, "prompt-queue.json"),

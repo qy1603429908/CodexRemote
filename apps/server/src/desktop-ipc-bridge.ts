@@ -2,7 +2,7 @@ import { EventEmitter } from "node:events";
 import { randomUUID } from "node:crypto";
 import { lstat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { posix } from "node:path";
 import { createConnection, type Socket } from "node:net";
 
 interface IpcFrame {
@@ -14,6 +14,8 @@ interface IpcFrame {
   targetClientIds?: string[] | null;
   params?: Record<string, unknown>;
   result?: Record<string, unknown>;
+  resultType?: string;
+  handledByClientId?: string;
   error?: unknown;
 }
 
@@ -33,6 +35,8 @@ interface FollowTarget {
 
 interface PendingRequest {
   method: string;
+  ownerClientId: string;
+  generation: number;
   resolve: (value: Record<string, unknown>) => void;
   reject: (error: Error) => void;
   timer: NodeJS.Timeout;
@@ -54,7 +58,7 @@ export function activeConversationTurnId(conversation: DesktopConversation | nul
 
 export function isExplicitInactiveSteerError(error: unknown): boolean {
   const text = errorText(error);
-  return /SteerTurnInactiveError|active turn already ended|NoActiveTurn|no active turn|without an active turn id|conversation is not being streamed/i.test(
+  return /SteerTurnInactiveError|active turn already ended|NoActiveTurn|no active turn|without an active turn id/i.test(
     text,
   );
 }
@@ -69,6 +73,12 @@ export function isUncertainDesktopSubmissionError(error: unknown): boolean {
 const IPC_VERSION: Record<string, number> = {
   "thread-stream-state-changed": 11,
   "thread-stream-following-changed": 1,
+  "thread-stream-following-status-requested": 1,
+  "ipc-connection-reset": 1,
+  "thread-archived": 2,
+  "thread-unarchived": 1,
+  "thread-queued-followups-changed": 1,
+  "thread-read-state-changed": 2,
   "thread-follower-start-turn": 1,
   "thread-follower-load-complete-history": 1,
   "thread-follower-compact-thread": 1,
@@ -79,7 +89,25 @@ const IPC_VERSION: Record<string, number> = {
   "thread-follower-file-approval-decision": 1,
   "thread-follower-permissions-request-approval-response": 1,
   "thread-follower-submit-user-input": 1,
+  "thread-follower-edit-last-user-turn": 2,
+  "thread-follower-submit-mcp-server-elicitation-response": 1,
+  "thread-follower-set-queued-follow-ups-state": 1,
 };
+
+export function defaultDesktopIpcEndpoint(
+  platform: NodeJS.Platform = process.platform,
+  homeDirectory = homedir(),
+): string {
+  return platform === "win32"
+    ? "\\\\.\\pipe\\codex-ipc"
+    : posix.join(homeDirectory, ".codex", "ipc", "ipc.sock");
+}
+
+export function isWindowsNamedPipeEndpoint(value: string): boolean {
+  const prefix = "\\\\.\\pipe\\";
+  if (!value.toLowerCase().startsWith(prefix)) return false;
+  return /^[A-Za-z0-9._-]+$/.test(value.slice(prefix.length));
+}
 
 /**
  * Adapter for the desktop GUI's local Codex IPC router.
@@ -95,6 +123,9 @@ export class DesktopIpcBridge extends EventEmitter {
   private clientId: string | null = null;
   private disposed = false;
   private reconnectTimer: NodeJS.Timeout | null = null;
+  private initializeTimer: NodeJS.Timeout | null = null;
+  private initializeRequestId: string | null = null;
+  private connectionGeneration = 0;
   private readonly follows = new Map<string, FollowTarget>();
   private readonly conversations = new Map<string, DesktopConversation>();
   private readonly revisions = new Map<string, number>();
@@ -107,7 +138,8 @@ export class DesktopIpcBridge extends EventEmitter {
 
   constructor(
     private readonly enabled: boolean,
-    private readonly socketPath = join(homedir(), ".codex", "ipc", "ipc.sock"),
+    private readonly socketPath = defaultDesktopIpcEndpoint(),
+    private readonly platform: NodeJS.Platform = process.platform,
   ) {
     super();
   }
@@ -117,7 +149,7 @@ export class DesktopIpcBridge extends EventEmitter {
   }
 
   get supported(): boolean {
-    return this.enabled && process.platform !== "win32" && !this.disposed;
+    return this.enabled && !this.disposed;
   }
 
   async start(): Promise<void> {
@@ -126,9 +158,10 @@ export class DesktopIpcBridge extends EventEmitter {
       this.emit(
         "unavailable",
         new Error(
-          "Desktop Codex IPC socket is unavailable or has unsafe ownership/permissions.",
+          "Desktop Codex IPC endpoint is unavailable or failed its local security check.",
         ),
       );
+      this.scheduleReconnect();
       return;
     }
     this.connect();
@@ -137,6 +170,9 @@ export class DesktopIpcBridge extends EventEmitter {
   async stop(): Promise<void> {
     this.disposed = true;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+    if (this.initializeTimer) clearTimeout(this.initializeTimer);
+    this.initializeTimer = null;
     for (const timer of this.refreshTimers.values()) clearTimeout(timer);
     this.refreshTimers.clear();
     this.rejectPending(new Error("Desktop IPC bridge stopped."));
@@ -303,7 +339,7 @@ export class DesktopIpcBridge extends EventEmitter {
     result: unknown,
   ): Promise<void> {
     const payload = record(result) ?? {};
-    if (method === "item/commandExecution/requestApproval") {
+    if (method === "item/commandExecution/requestApproval" || method === "execCommandApproval") {
       await this.requestFollower(
         conversationId,
         "thread-follower-command-approval-decision",
@@ -315,7 +351,7 @@ export class DesktopIpcBridge extends EventEmitter {
       );
       return;
     }
-    if (method === "item/fileChange/requestApproval") {
+    if (method === "item/fileChange/requestApproval" || method === "applyPatchApproval") {
       await this.requestFollower(
         conversationId,
         "thread-follower-file-approval-decision",
@@ -354,10 +390,10 @@ export class DesktopIpcBridge extends EventEmitter {
       conversationId,
       hostId,
     });
-    this.announceFollow(conversationId);
     return new Promise((resolve) => {
       const waiters = this.followWaiters.get(conversationId) ?? new Set();
       let settled = false;
+      let timer: NodeJS.Timeout;
       const finish = (conversation: DesktopConversation | null) => {
         if (settled) return;
         settled = true;
@@ -368,8 +404,11 @@ export class DesktopIpcBridge extends EventEmitter {
       };
       waiters.add(finish);
       this.followWaiters.set(conversationId, waiters);
-      const timer = setTimeout(() => finish(null), timeoutMs);
+      timer = setTimeout(() => finish(null), timeoutMs);
       timer.unref();
+      this.announceFollow(conversationId);
+      const discovered = this.conversations.get(conversationId);
+      if (discovered && this.hasOwner(conversationId)) finish(discovered);
     });
   }
 
@@ -390,27 +429,39 @@ export class DesktopIpcBridge extends EventEmitter {
     }
     if (!this.clientId || !target?.ownerClientId)
       throw new Error("Desktop GUI is not the active owner of this task.");
+    if (!this.socket?.writable)
+      throw new Error("Desktop IPC connection closed.");
     const requestId = randomUUID();
+    const ownerClientId = target.ownerClientId;
+    const generation = this.connectionGeneration;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pendingRequests.delete(requestId);
         reject(new Error(`Desktop IPC request timed out: ${method}`));
       }, timeoutMs);
       timer.unref();
-      this.pendingRequests.set(requestId, { method, resolve, reject, timer });
+      this.pendingRequests.set(requestId, {
+        method,
+        ownerClientId,
+        generation,
+        resolve,
+        reject,
+        timer,
+      });
       this.write({
         type: "request",
         requestId,
         method,
-        version: IPC_VERSION[method] ?? 1,
+        version: IPC_VERSION[method] ?? 0,
         sourceClientId: this.clientId,
-        targetClientIds: [target.ownerClientId],
+        targetClientIds: [ownerClientId],
         params,
       });
     });
   }
 
   private async isSafeSocket(): Promise<boolean> {
+    if (this.platform === "win32") return isWindowsNamedPipeEndpoint(this.socketPath);
     try {
       const stat = await lstat(this.socketPath);
       const uid = process.getuid?.();
@@ -426,12 +477,24 @@ export class DesktopIpcBridge extends EventEmitter {
 
   private connect(): void {
     if (this.socket || this.disposed) return;
+    this.reconnectTimer = null;
+    this.buffer = Buffer.alloc(0);
     const socket = createConnection(this.socketPath);
     this.socket = socket;
+    this.connectionGeneration += 1;
     socket.on("connect", () => {
+      if (this.initializeTimer) clearTimeout(this.initializeTimer);
+      this.initializeTimer = setTimeout(() => {
+        if (this.socket !== socket || this.clientId) return;
+        this.emit("diagnostic", new Error("Desktop IPC initialize timed out."));
+        socket.destroy();
+      }, 10_000);
+      this.initializeTimer.unref();
+      const requestId = randomUUID();
+      this.initializeRequestId = requestId;
       this.write({
         type: "request",
-        requestId: randomUUID(),
+        requestId,
         method: "initialize",
         params: { clientType: "codex-mobile-remote" },
       });
@@ -442,16 +505,28 @@ export class DesktopIpcBridge extends EventEmitter {
       if (this.socket !== socket) return;
       this.socket = null;
       this.clientId = null;
+      this.initializeRequestId = null;
+      this.connectionGeneration += 1;
+      this.buffer = Buffer.alloc(0);
+      if (this.initializeTimer) clearTimeout(this.initializeTimer);
+      this.initializeTimer = null;
       this.rejectPending(new Error("Desktop IPC connection closed."));
+      this.resolveAllFollowWaiters(null);
       for (const target of this.follows.values()) delete target.ownerClientId;
       this.conversations.clear();
       this.revisions.clear();
       this.emit("offline");
-      if (!this.disposed) {
-        this.reconnectTimer = setTimeout(() => this.connect(), 1_000);
-        this.reconnectTimer.unref();
-      }
+      this.scheduleReconnect();
     });
+  }
+
+  private scheduleReconnect(): void {
+    if (!this.supported || this.reconnectTimer) return;
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      void this.start();
+    }, 1_000);
+    this.reconnectTimer.unref();
   }
 
   private handleData(chunk: Buffer): void {
@@ -473,6 +548,8 @@ export class DesktopIpcBridge extends EventEmitter {
         this.handleFrame(JSON.parse(body.toString("utf8")) as IpcFrame);
       } catch (error) {
         this.emit("diagnostic", error);
+        this.socket?.destroy();
+        return;
       }
     }
   }
@@ -481,9 +558,14 @@ export class DesktopIpcBridge extends EventEmitter {
     if (
       frame.type === "response" &&
       frame.method === "initialize" &&
+      frame.requestId === this.initializeRequestId &&
       typeof frame.result?.clientId === "string"
     ) {
       this.clientId = frame.result.clientId;
+      this.initializeRequestId = null;
+      if (this.initializeTimer) clearTimeout(this.initializeTimer);
+      this.initializeTimer = null;
+      this.requestFollowingStatus();
       for (const conversationId of this.follows.keys())
         this.announceFollow(conversationId);
       this.emit("ready");
@@ -492,9 +574,12 @@ export class DesktopIpcBridge extends EventEmitter {
     if (frame.type === "response" && typeof frame.requestId === "string") {
       const pending = this.pendingRequests.get(frame.requestId);
       if (!pending) return;
+      if (pending.generation !== this.connectionGeneration) return;
+      if (frame.method && frame.method !== pending.method) return;
+      if (frame.handledByClientId && frame.handledByClientId !== pending.ownerClientId) return;
       clearTimeout(pending.timer);
       this.pendingRequests.delete(frame.requestId);
-      if (frame.error != null || frame.result?.resultType === "error") {
+      if (frame.error != null || frame.resultType === "error" || frame.result?.resultType === "error") {
         pending.reject(
           new Error(
             errorText(
@@ -519,6 +604,58 @@ export class DesktopIpcBridge extends EventEmitter {
       return;
     }
     if (frame.type !== "broadcast" || !frame.method || !frame.params) return;
+    const expectedVersion = IPC_VERSION[frame.method];
+    if (expectedVersion != null && (frame.version ?? 0) !== expectedVersion) {
+      this.emit(
+        "diagnostic",
+        new Error(
+          `Unsupported Desktop IPC ${frame.method} version ${frame.version ?? 0}; expected ${expectedVersion}.`,
+        ),
+      );
+      return;
+    }
+
+    if (frame.method === "ipc-connection-reset") {
+      this.connectionGeneration += 1;
+      this.rejectPending(new Error("Desktop IPC connection reset."));
+      for (const target of this.follows.values()) delete target.ownerClientId;
+      this.conversations.clear();
+      this.revisions.clear();
+      this.emit("reset");
+      for (const conversationId of this.follows.keys())
+        this.announceFollow(conversationId);
+      return;
+    }
+
+    if (frame.method === "thread-stream-following-status-requested") {
+      const requestedConversationId = stringField(frame.params.conversationId);
+      if (requestedConversationId) {
+        const hostId = stringField(frame.params.hostId) ?? "local";
+        this.follows.set(requestedConversationId, {
+          ...(this.follows.get(requestedConversationId) ?? {
+            conversationId: requestedConversationId,
+            hostId,
+          }),
+          conversationId: requestedConversationId,
+          hostId,
+        });
+        this.announceFollow(requestedConversationId, frame.sourceClientId);
+      } else {
+        for (const conversationId of this.follows.keys())
+          this.announceFollow(conversationId, frame.sourceClientId);
+      }
+      return;
+    }
+
+    if (frame.method === "thread-archived") {
+      this.emit("threadArchived", frame.params);
+      return;
+    }
+
+    if (frame.method === "thread-unarchived") {
+      this.emit("threadUnarchived", frame.params);
+      return;
+    }
 
     if (frame.method === "thread-queued-followups-changed") {
       const conversationId = stringField(frame.params.conversationId);
@@ -530,14 +667,22 @@ export class DesktopIpcBridge extends EventEmitter {
     if (frame.method === "thread-stream-following-changed") {
       const conversationId = stringField(frame.params.conversationId);
       const hostId = stringField(frame.params.hostId) ?? "local";
-      if (
-        conversationId &&
-        frame.params.following === true &&
-        frame.sourceClientId !== this.clientId &&
-        !this.follows.has(conversationId)
-      ) {
-        this.follows.set(conversationId, { conversationId, hostId });
+      if (!conversationId || frame.sourceClientId === this.clientId) return;
+      if (frame.params.following === true) {
+        this.follows.set(conversationId, {
+          ...(this.follows.get(conversationId) ?? { conversationId, hostId }),
+          conversationId,
+          hostId,
+        });
         this.announceFollow(conversationId);
+      } else if (frame.params.following === false) {
+        const target = this.follows.get(conversationId);
+        if (target && target.ownerClientId === frame.sourceClientId) {
+          delete target.ownerClientId;
+          this.conversations.delete(conversationId);
+          this.revisions.delete(conversationId);
+          this.emit("ownerLost", conversationId);
+        }
       }
       return;
     }
@@ -556,10 +701,8 @@ export class DesktopIpcBridge extends EventEmitter {
         const conversation = record(change.conversationState);
         if (!conversation) return;
         const revision = numberField(change.revision);
-        if (revision != null) {
-          this.revisions.set(conversationId, revision);
-          this.emit(`revision:${conversationId}`, revision);
-        }
+        const currentRevision = this.revisions.get(conversationId);
+        if (revision != null && currentRevision != null && revision < currentRevision) return;
         const target = this.follows.get(conversationId) ?? {
           conversationId,
           hostId,
@@ -572,10 +715,47 @@ export class DesktopIpcBridge extends EventEmitter {
           conversation,
         );
         this.conversations.set(conversationId, normalized);
+        if (revision != null) {
+          this.revisions.set(conversationId, revision);
+          this.emit(`revision:${conversationId}`, revision);
+        }
         this.resolveFollowWaiters(conversationId, normalized);
         this.emit("snapshot", normalized);
       } else if (change.type === "patches") {
-        this.scheduleRefresh(conversationId);
+        const target = this.follows.get(conversationId);
+        if (target?.ownerClientId !== frame.sourceClientId) return;
+        const baseRevision = numberField(change.baseRevision);
+        const revision = numberField(change.revision);
+        const currentRevision = this.revisions.get(conversationId);
+        const current = this.conversations.get(conversationId);
+        const patches = Array.isArray(change.patches) ? change.patches : null;
+        if (revision != null && currentRevision != null && revision <= currentRevision) return;
+        if (
+          !current ||
+          !patches ||
+          baseRevision == null ||
+          revision == null ||
+          currentRevision == null ||
+          baseRevision !== currentRevision
+        ) {
+          this.scheduleRefresh(conversationId);
+          return;
+        }
+        try {
+          const patched = applyDesktopPatches(current, patches);
+          const normalized = normalizeDesktopConversation(
+            conversationId,
+            hostId,
+            patched,
+          );
+          this.conversations.set(conversationId, normalized);
+          this.revisions.set(conversationId, revision);
+          this.emit(`revision:${conversationId}`, revision);
+          this.emit("snapshot", normalized);
+        } catch (error) {
+          this.emit("diagnostic", error);
+          this.scheduleRefresh(conversationId);
+        }
       }
     }
   }
@@ -621,14 +801,34 @@ export class DesktopIpcBridge extends EventEmitter {
     });
   }
 
-  private announceFollow(conversationId: string): void {
+
+  private requestFollowingStatus(): void {
+    if (!this.clientId) return;
+    this.write({
+      type: "broadcast",
+      method: "thread-stream-following-status-requested",
+      sourceClientId: this.clientId,
+      targetClientIds: null,
+      version: IPC_VERSION["thread-stream-following-status-requested"],
+      params: {},
+    });
+  }
+
+  private announceFollow(
+    conversationId: string,
+    requestedByClientId?: string,
+  ): void {
     const target = this.follows.get(conversationId);
     if (!this.clientId || !target) return;
     this.write({
       type: "broadcast",
       method: "thread-stream-following-changed",
       sourceClientId: this.clientId,
-      targetClientIds: target.ownerClientId ? [target.ownerClientId] : null,
+      targetClientIds: requestedByClientId
+        ? [requestedByClientId]
+        : target.ownerClientId
+          ? [target.ownerClientId]
+          : null,
       version: IPC_VERSION["thread-stream-following-changed"],
       params: { conversationId, hostId: target.hostId, following: true },
     });
@@ -668,6 +868,81 @@ export class DesktopIpcBridge extends EventEmitter {
     header.writeUInt32LE(body.length, 0);
     socket.write(Buffer.concat([header, body]));
   }
+}
+
+interface DesktopPatch {
+  op?: unknown;
+  path?: unknown;
+  value?: unknown;
+}
+
+export function applyDesktopPatches(
+  conversation: DesktopConversation,
+  values: unknown[],
+): Record<string, unknown> {
+  const next = structuredClone(conversation) as Record<string, unknown>;
+  for (const value of values) {
+    const patch = record(value) as DesktopPatch | null;
+    if (!patch || !Array.isArray(patch.path) || patch.path.length === 0)
+      throw new Error("Desktop IPC patch path is invalid.");
+    const path = patch.path as Array<string | number>;
+    let parent: unknown = next;
+    for (const segment of path.slice(0, -1))
+      parent = patchChild(parent, segment);
+    applyDesktopPatchOperation(parent, path.at(-1)!, String(patch.op ?? ""), patch.value);
+  }
+  return next;
+}
+
+function patchChild(parent: unknown, segment: string | number): unknown {
+  if (Array.isArray(parent)) {
+    const index = patchArrayIndex(segment, parent.length, false);
+    const child = parent[index];
+    if (child == null || typeof child !== "object")
+      throw new Error("Desktop IPC patch traversed a missing array value.");
+    return child;
+  }
+  const object = record(parent);
+  if (!object) throw new Error("Desktop IPC patch traversed a non-object value.");
+  const child = object[String(segment)];
+  if (child == null || typeof child !== "object")
+    throw new Error("Desktop IPC patch traversed a missing object value.");
+  return child;
+}
+
+function applyDesktopPatchOperation(
+  parent: unknown,
+  segment: string | number,
+  operation: string,
+  value: unknown,
+): void {
+  if (!['add', 'replace', 'remove'].includes(operation))
+    throw new Error(`Unsupported Desktop IPC patch operation: ${operation}`);
+  if (Array.isArray(parent)) {
+    const index = patchArrayIndex(segment, parent.length, operation === "add");
+    if (operation === "add") parent.splice(index, 0, value);
+    else if (operation === "replace") parent[index] = value;
+    else parent.splice(index, 1);
+    return;
+  }
+  const object = record(parent);
+  if (!object) throw new Error("Desktop IPC patch parent is not an object.");
+  const key = String(segment);
+  if (operation === "remove") delete object[key];
+  else object[key] = value;
+}
+
+function patchArrayIndex(
+  segment: string | number,
+  length: number,
+  allowEnd: boolean,
+): number {
+  if (allowEnd && segment === "-") return length;
+  const index = typeof segment === "number" ? segment : Number(segment);
+  const maximum = allowEnd ? length : length - 1;
+  if (!Number.isInteger(index) || index < 0 || index > maximum)
+    throw new Error(`Desktop IPC patch array index is invalid: ${String(segment)}`);
+  return index;
 }
 
 export function normalizeDesktopConversation(

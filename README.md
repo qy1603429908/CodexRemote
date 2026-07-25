@@ -84,7 +84,7 @@ Set the real Codex data directory explicitly so the Codex Desktop bundled CLI do
 CODEX_HOME=C:\Users\<username>\.codex
 ```
 
-The Server passes this value to `codex app-server` and verifies the `codexHome` returned by `initialize`. A mismatch fails startup instead of silently serving an empty history. Desktop private IPC following is currently unavailable on Windows, so the Server uses `codex app-server` directly for task history and resume operations.
+The Server passes this value to `codex app-server` and verifies the `codexHome` returned by `initialize`. A mismatch fails startup instead of silently serving an empty history. On Windows, the Server also follows the Codex Desktop owner through the local named pipe `\\.\pipe\codex-ipc`, applies revisioned live patches in memory, and forwards canonical task snapshots over `/ws`. Set `CMR_DESKTOP_IPC=0` only when this private integration must be disabled.
 
 ### 连接方式
 

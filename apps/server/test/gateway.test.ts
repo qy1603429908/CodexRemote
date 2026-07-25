@@ -80,11 +80,16 @@ class FakeBridge extends EventEmitter {
 
 class FakeDesktop extends EventEmitter {
   owner = true;
+  ready = true;
+  supported = true;
   steerError: Error | null = null;
   conversation: Record<string, unknown> = { id: "thread-1", threadRuntimeStatus: { type: "active", activeFlags: [] }, turns: [{ id: "turn-active", status: "inProgress", items: [] }] };
   calls: Array<{ method: string; threadId: string; params: Record<string, unknown> }> = [];
   hasOwner(): boolean { return this.owner; }
   getConversation(): Record<string, unknown> { return this.conversation; }
+  async openConversation(): Promise<Record<string, unknown> | null> {
+    return this.owner ? this.conversation : null;
+  }
   async steerTurn(threadId: string, params: Record<string, unknown>): Promise<unknown> {
     this.calls.push({ method: "steer", threadId, params });
     if (this.steerError) throw this.steerError;
@@ -93,6 +98,10 @@ class FakeDesktop extends EventEmitter {
   async startTurn(threadId: string, params: Record<string, unknown>): Promise<unknown> {
     this.calls.push({ method: "start", threadId, params });
     return { id: "started" };
+  }
+  async interruptTurn(threadId: string, mode: "user" | "system"): Promise<unknown> {
+    this.calls.push({ method: "interrupt", threadId, params: { mode } });
+    return {};
   }
 }
 
@@ -253,9 +262,17 @@ describe("MobileGateway", () => {
       params: { threadId: "thread-1", turn: { id: "turn-running", status: "inProgress" } },
     });
     desktop.emit("snapshot", desktop.conversation);
-    await waitFor(() => messages.some((message) => message.type === "event" && message.method === "desktop/threadSnapshot"));
+    await waitFor(() => messages.some((message) => {
+      if (message.type !== "event" || message.method !== "desktop/threadSnapshot") return false;
+      const params = message.params as { thread?: { status?: { type?: string } } } | undefined;
+      return params?.thread?.status?.type === "active";
+    }));
 
-    const desktopSnapshot = messages.findLast((message) => message.type === "event" && message.method === "desktop/threadSnapshot");
+    const desktopSnapshot = messages.findLast((message) => {
+      if (message.type !== "event" || message.method !== "desktop/threadSnapshot") return false;
+      const params = message.params as { thread?: { status?: { type?: string } } } | undefined;
+      return params?.thread?.status?.type === "active";
+    });
     const desktopParams = desktopSnapshot?.params as { thread?: { status?: unknown; threadRuntimeStatus?: unknown } } | undefined;
     expect(desktopParams?.thread?.status).toEqual({ type: "active", activeFlags: [] });
     expect(desktopParams?.thread?.threadRuntimeStatus).toEqual({ type: "active", activeFlags: [] });
@@ -275,6 +292,68 @@ describe("MobileGateway", () => {
     const idleThreadsMessage = messages.find((message) => message.type === "threads" && message.requestId === "idle-after-completed");
     const idleThreads = idleThreadsMessage?.threads as Array<{ id: string; status: unknown }>;
     expect(idleThreads.find((thread) => thread.id === "thread-1")?.status).toEqual({ type: "idle" });
+    ws.close();
+  });
+
+  it("streams Desktop snapshots only to sockets subscribed to the active task", async () => {
+    const desktop = new FakeDesktop();
+    desktop.conversation = {
+      id: "thread-1",
+      cwd: process.platform === "win32" ? "C:\\Users\\alice\\project" : "/tmp/project",
+      threadRuntimeStatus: { type: "active", activeFlags: [] },
+      turns: [{ id: "turn-live", status: "inProgress", items: [{ id: "item-1", type: "agentMessage", text: "one" }] }],
+    };
+    const { port } = await start(desktop);
+    const encoded = Buffer.from(token).toString("base64url");
+    const subscribed = new WebSocket(`ws://127.0.0.1:${port}/ws`, ["codex-mobile-v1", `token.${encoded}`], { origin: "capacitor://localhost" });
+    const observer = new WebSocket(`ws://127.0.0.1:${port}/ws`, ["codex-mobile-v1", `token.${encoded}`], { origin: "capacitor://localhost" });
+    const subscribedMessages: Array<Record<string, unknown>> = [];
+    const observerMessages: Array<Record<string, unknown>> = [];
+    subscribed.on("message", (data) => subscribedMessages.push(JSON.parse(data.toString())));
+    observer.on("message", (data) => observerMessages.push(JSON.parse(data.toString())));
+    await Promise.all([
+      new Promise<void>((resolve, reject) => { subscribed.once("open", resolve); subscribed.once("error", reject); }),
+      new Promise<void>((resolve, reject) => { observer.once("open", resolve); observer.once("error", reject); }),
+    ]);
+    subscribed.send(JSON.stringify({ type: "thread.open", requestId: "desktop-open", threadId: "thread-1", historyLimit: 20 }));
+    await waitFor(() => subscribedMessages.some((message) => message.type === "thread" && message.requestId === "desktop-open"));
+
+    desktop.conversation = {
+      ...desktop.conversation,
+      turns: [{ id: "turn-live", status: "inProgress", items: [
+        { id: "item-1", type: "agentMessage", text: "one" },
+        { id: "item-2", type: "commandExecution", status: "inProgress" },
+      ] }],
+    };
+    desktop.emit("snapshot", desktop.conversation);
+    await waitFor(() => subscribedMessages.some((message) => message.type === "event" && message.method === "desktop/threadSnapshot"));
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(observerMessages.some((message) => message.type === "event" && message.method === "desktop/threadSnapshot")).toBe(false);
+    const snapshot = subscribedMessages.findLast((message) => message.type === "event" && message.method === "desktop/threadSnapshot");
+    const thread = (snapshot?.params as { thread?: { turns?: Array<{ items?: unknown[] }> } } | undefined)?.thread;
+    expect(thread?.turns?.at(-1)?.items).toHaveLength(2);
+    subscribed.close();
+    observer.close();
+  });
+
+  it("drops stale Desktop active state when IPC goes offline", async () => {
+    const desktop = new FakeDesktop();
+    const { bridge, port } = await start(desktop);
+    const encoded = Buffer.from(token).toString("base64url");
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`, ["codex-mobile-v1", `token.${encoded}`], { origin: "capacitor://localhost" });
+    const messages: Array<Record<string, unknown>> = [];
+    ws.on("message", (data) => messages.push(JSON.parse(data.toString())));
+    await new Promise<void>((resolve, reject) => { ws.once("open", resolve); ws.once("error", reject); });
+    desktop.emit("snapshot", desktop.conversation);
+    await waitFor(() => messages.some((message) => message.type === "threads.delta"));
+    bridge.threadListData = [{
+      id: "thread-1", name: "Test", preview: "Hello", cwd: "/tmp", modelProvider: "custom", updatedAt: 10, status: { type: "notLoaded" }, source: "appServer",
+    }];
+    desktop.emit("offline");
+    await waitFor(() => messages.some((message) => message.type === "threads.snapshot"));
+    const refreshed = messages.findLast((message) => message.type === "threads.snapshot");
+    const threads = refreshed?.threads as Array<{ id: string; status: unknown }>;
+    expect(threads.find((thread) => thread.id === "thread-1")?.status).toEqual({ type: "notLoaded" });
     ws.close();
   });
 
@@ -412,6 +491,45 @@ describe("MobileGateway", () => {
     expect(bridge.responses).toEqual([{ id: 42, result: { decision: "accept" } }]);
     ws.close();
   });
+  it("keeps Desktop approvals pending when only app-server goes offline", async () => {
+    const desktop = new FakeDesktop();
+    const { bridge, gateway } = await start(desktop);
+    desktop.emit("snapshot", {
+      ...desktop.conversation,
+      requests: [{
+        id: "desktop-command",
+        method: "item/commandExecution/requestApproval",
+        params: { command: "echo desktop" },
+      }],
+    });
+    bridge.emit("serverRequest", {
+      id: 42,
+      method: "item/commandExecution/requestApproval",
+      params: { command: "echo app-server" },
+    });
+    const approvals = (gateway as unknown as { approvals: Map<string | number, unknown> }).approvals;
+    await waitFor(() => approvals.size === 2);
+    bridge.emit("offline", new Error("app-server stopped"));
+    expect(approvals.has(42)).toBe(false);
+    expect(approvals.has("desktop:thread-1:desktop-command")).toBe(true);
+  });
+
+  it("rejects a stale Desktop interrupt turn id", async () => {
+    const desktop = new FakeDesktop();
+    const { port } = await start(desktop);
+    const encoded = Buffer.from(token).toString("base64url");
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`, ["codex-mobile-v1", `token.${encoded}`], { origin: "capacitor://localhost" });
+    const messages: Array<Record<string, unknown>> = [];
+    ws.on("message", (data) => messages.push(JSON.parse(data.toString())));
+    await new Promise<void>((resolve, reject) => { ws.once("open", resolve); ws.once("error", reject); });
+    ws.send(JSON.stringify({ type: "turn.interrupt", requestId: "stale-interrupt", threadId: "thread-1", turnId: "turn-old" }));
+    await waitFor(() => messages.some((message) => message.type === "error" && message.requestId === "stale-interrupt"));
+    expect(desktop.calls.filter((call) => call.method === "interrupt")).toHaveLength(0);
+    ws.send(JSON.stringify({ type: "turn.interrupt", requestId: "current-interrupt", threadId: "thread-1", turnId: "turn-active" }));
+    await waitFor(() => desktop.calls.some((call) => call.method === "interrupt"));
+    ws.close();
+  });
+
   it("routes permission approvals with granted profile and scope", async () => {
     const { bridge, port } = await start();
     const encoded = Buffer.from(token).toString("base64url");
