@@ -70,3 +70,50 @@ describe('conversation horizontal overflow constraints', () => {
     expect(declarations('.agent-strip')).toMatch(/overflow-x:\s*auto/);
   });
 });
+
+const capacitorConfig = readFileSync(new URL('../capacitor.config.ts', import.meta.url), 'utf8');
+const appSource = readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8');
+const mainActivity = readFileSync(new URL('../android/app/src/main/java/dev/codexmobile/remote/MainActivity.java', import.meta.url), 'utf8');
+
+describe('Android system-bar safe areas', () => {
+  it('uses Capacitor SystemBars as the single inset owner', () => {
+    expect(capacitorConfig).toMatch(/SystemBars:\s*\{/);
+    expect(capacitorConfig).toMatch(/insetsHandling:\s*'css'/);
+    expect(capacitorConfig).toMatch(/style:\s*'LIGHT'/);
+    expect(appSource).toMatch(/SystemBars\.setStyle\(\{ style: SystemBarsStyle\.Light \}\)/);
+    expect(appSource).not.toMatch(/StatusBar\.setOverlaysWebView/);
+    expect(mainActivity).not.toMatch(/WindowInsets|setDecorFitsSystemWindows|setPadding/);
+  });
+
+  it('routes every component through the unified Capacitor-to-web safe-area fallback', () => {
+    expect(css).toMatch(/--app-safe-top:\s*var\(--safe-area-inset-top,\s*env\(safe-area-inset-top,\s*0px\)\)/);
+    expect(css).toMatch(/--app-safe-bottom:\s*var\(--safe-area-inset-bottom,\s*env\(safe-area-inset-bottom,\s*0px\)\)/);
+    expect((css.match(/env\(safe-area-inset-/g) ?? [])).toHaveLength(4);
+    expect(declarations('.conversation-top-bar')).toMatch(/padding-top:\s*calc\(var\(--app-safe-top\) \+ 10px\)/);
+    expect(declarations('.composer-shell')).toMatch(/var\(--app-safe-bottom\)/);
+    expect(declarations('.bottom-sheet')).toMatch(/var\(--app-safe-bottom\)/);
+    expect(declarations('.error-toast')).toMatch(/var\(--app-safe-bottom\)/);
+    expect(declarations('.agent-sheet-backdrop')).toMatch(/var\(--app-safe-bottom\)/);
+    expect(declarations('.message-stream')).toMatch(/var\(--app-safe-left\)/);
+    expect(declarations('.message-stream')).toMatch(/var\(--app-safe-right\)/);
+    expect(declarations('.session-toolbar')).toMatch(/var\(--app-safe-left\)/);
+    expect(declarations('.agent-strip')).toMatch(/var\(--app-safe-right\)/);
+    expect(declarations('.prompt-queue-panel')).toMatch(/var\(--app-safe-left\)/);
+    expect(declarations('.git-diff-panel')).toMatch(/var\(--app-safe-right\)/);
+    expect(declarations('.activity-status-slot')).toMatch(/var\(--app-safe-left\)/);
+    expect(declarations('.activity-status-slot')).toMatch(/var\(--app-safe-right\)/);
+    expect(declarations('.compaction-status')).toMatch(/var\(--app-safe-left\)/);
+    expect(declarations('.compaction-status')).toMatch(/var\(--app-safe-right\)/);
+  });
+});
+
+const workspacePathFix = readFileSync(new URL('../scripts/fix-capacitor-workspace-paths.mjs', import.meta.url), 'utf8');
+
+describe('Android workspace build path normalization', () => {
+  it('normalizes Capacitor node_modules paths without hard-coding a checkout directory', () => {
+    expect(workspacePathFix).toMatch(/dependencyPathPattern/);
+    expect(workspacePathFix).toMatch(/node_modules/);
+    expect(workspacePathFix).toContain("new File('../../../node_modules/");
+    expect(workspacePathFix).not.toContain('codex-mobile-remote/node_modules');
+  });
+});

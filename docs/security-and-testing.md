@@ -157,17 +157,19 @@ bridge 仍会启动自己的 `codex app-server --listen stdio://` 读取历史�
 
 ### Subagent 边界
 
-当前 gateway 已显式请求所有交互式及 Subagent `sourceKinds`，并兼容顶层 `parentThreadId` 与 `source.subAgent.thread_spawn.parent_thread_id`。本机真实 wire 联调已观察到目录内父任务和 Subagent 层级；Android 真机小屏触控仍未验证。
+当前 gateway 的初次索引查询会显式请求所有交互式及 Subagent `sourceKinds`，并兼容顶层 `parentThreadId` 与 `source.subAgent.thread_spawn.parent_thread_id`。本机真实 wire 联调已观察到目录内父任务和 Subagent 层级。
+
+2026-07-25 的反例是 Singer：Desktop 可见，按 ID `thread.open` 成功，但 Host `threads.list` 缺失。v0.3.3 Android 客户端会从父任务协作活动恢复 ID，并把 Agent 工具调用渲染为可直接打开的 Subagent 入口；如果 Host 从未发送该 ID，客户端仍无法发现，Host 索引刷新留待后续非 Android 分支修复。Android 真机小屏触控仍未验证。
 
 ### Android 本地通知边界
 
 本地通知不是推送服务：
 
 - 没有 FCM；
-- 有用户主动启动的原生前台 Service 作为后台运行基础，但 WebSocket 重连仍由客户端连接层负责；
+- 用户主动启动的原生前台 Service 内含只读 WebSocket 观察者，可在 WebView 被冻住时继续重连；只发送 `threads.list` 应用消息，保活使用 WebSocket ping frame，不发送控制消息；
 - 没有离线完成事件的服务端持久队列、跨主机推送或开机自启补偿；
-- 只有 App/WebSocket 实际收到 `turn/completed` 或审批事件时，通知才可靠；
-- App 被休眠、杀死或断网时可能漏通知；
+- WebView 与原生观察者使用相同通知 ID，收到同一事件时去重；
+- Android 强行停止、前台服务被厂商阻止、设备断网或 bridge 离线时仍可能漏通知；
 - 同一文件审批因 Diff 更新被再次广播时，审批卡片更新，但通知按 request ID 去重。
 
 通知权限、渠道显示、前后台行为、Doze 和进程被杀后的表现均尚未在 Android 真机验证。

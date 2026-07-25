@@ -87,8 +87,10 @@ function AttachmentGallery({ message, onLoad, onDownload }: {
   ))}</div>;
 }
 
-export function MessageBubble({ message, onLoadAttachment, onDownloadAttachment }: {
+export function MessageBubble({ message, agentTargets = [], onOpenAgent, onLoadAttachment, onDownloadAttachment }: {
   message: RemoteMessage;
+  agentTargets?: Array<{ id: string; label: string; state: string }>;
+  onOpenAgent?: (agentId: string) => void;
   onLoadAttachment?: (path: string) => Promise<LoadedAttachment>;
   onDownloadAttachment?: (path: string) => void;
 }) {
@@ -150,6 +152,17 @@ export function MessageBubble({ message, onLoadAttachment, onDownloadAttachment 
               {message.status === 'streaming' && <span className="typing-caret" />}
             </div>
           </>
+        )}
+        {agentTargets.length > 0 && (
+          <nav className="message-agent-links" aria-label="此工具调用关联的 Subagent">
+            {agentTargets.map((agent) => (
+              <button key={agent.id} type="button" onClick={() => onOpenAgent?.(agent.id)}>
+                <span aria-hidden="true" />
+                <strong>{agent.label}</strong>
+                <small>打开</small>
+              </button>
+            ))}
+          </nav>
         )}
       </div>
     </article>

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { canonicalProjectedItems, compactionStatusFromThreadPayload, contextCompactionItemIdsFromThreadPayload, dedupeMessages, normalizeThreadPayload, optimisticAttachmentsFromUploads, reconcileMessages, reconcileThreadSnapshot, stateFromStatus, visibleUserText } from '../src/hooks/useRemote';
+import { canonicalProjectedItems, compactionStatusFromThreadPayload, contextCompactionItemIdsFromThreadPayload, dedupeMessages, normalizeThreadPayload, optimisticAttachmentsFromUploads, reconcileMessages, reconcileThreadSnapshot, stateFromStatus, turnIdsAfterSnapshot, visibleUserText } from '../src/hooks/useRemote';
 import type { RemoteMessage } from '../src/types/protocol';
 
 function user(id: string, content: string, createdAt: number): RemoteMessage {
@@ -10,6 +10,12 @@ describe('Desktop/mobile reconciliation', () => {
   it('maps Desktop notLoaded to an explicit non-idle state', () => {
     expect(stateFromStatus({ type: 'notLoaded' })).toBe('not_loaded');
     expect(stateFromStatus({ type: 'active', activeFlags: ['waitingOnApproval'] })).toBe('waiting_approval');
+    expect(stateFromStatus({ type: 'active', activeFlags: ['waitingOnUserInput'] })).toBe('waiting_input');
+  });
+
+  it('clears a stale current turn when an authoritative snapshot is idle', () => {
+    expect(turnIdsAfterSnapshot({ thread: 'old-turn', other: 'keep' }, 'thread')).toEqual({ other: 'keep' });
+    expect(turnIdsAfterSnapshot({ other: 'keep' }, 'thread', 'new-turn')).toEqual({ other: 'keep', thread: 'new-turn' });
   });
 
   it('removes a nearby optimistic duplicate when canonical history arrives', () => {
@@ -315,6 +321,33 @@ describe('Desktop canonical item parsing', () => {
       attachments: [{ type: 'image', name: 'photo.jpg', path: '/tmp/example-codex-mobile-remote/uploads/example/photo.jpg' }],
     });
     expect(normalized.messages[0]?.content).not.toContain('/Users/');
+  });
+
+
+  it('drops a stale synthetic reasoning tail when a newer Desktop snapshot is authoritative', () => {
+    const stale: RemoteMessage = {
+      id: 'turn_item/reasoning/summaryTextDelta', threadId: 'thread', turnId: 'turn', role: 'system',
+      content: '旧 JWT 梗概', createdAt: 1, status: 'streaming', itemType: 'reasoning', toolName: '思考梗概',
+    };
+    const canonical: RemoteMessage = {
+      id: 'reason-new', threadId: 'thread', turnId: 'turn', role: 'system',
+      content: '正在修复 Subagent 同步', createdAt: 1, status: 'streaming', itemType: 'reasoning', toolName: '思考梗概',
+    };
+    expect(reconcileThreadSnapshot([stale], [canonical])).toEqual([canonical]);
+  });
+
+
+  it('recovers Subagent parent and nickname from wrapped lowercase source metadata', () => {
+    const normalized = normalizeThreadPayload({ thread: {
+      id: 'child',
+      source: { desktopIpc: true, original: { subagent: { thread_spawn: {
+        parent_thread_id: 'parent', agent_nickname: 'Singer', agent_role: 'reviewer',
+      } } } },
+      turns: [],
+    } });
+    expect(normalized.thread).toMatchObject({
+      id: 'child', parentThreadId: 'parent', agentNickname: 'Singer', agentRole: 'reviewer',
+    });
   });
 
   it('keeps reasoning from the active Desktop turn as transient streaming state', () => {

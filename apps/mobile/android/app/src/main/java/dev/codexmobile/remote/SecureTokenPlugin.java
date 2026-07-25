@@ -27,11 +27,11 @@ public class SecureTokenPlugin extends Plugin {
     private static final String PREFS = "codex_mobile_remote_secure";
     private static final String TRANSFORMATION = "AES/GCM/NoPadding";
 
-    private SharedPreferences preferences() {
-        return getContext().getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+    private static SharedPreferences preferences(Context context) {
+        return context.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
     }
 
-    private SecretKey getOrCreateKey() throws Exception {
+    private static SecretKey getOrCreateKey() throws Exception {
         KeyStore keyStore = KeyStore.getInstance(KEYSTORE);
         keyStore.load(null);
         if (keyStore.containsAlias(KEY_ALIAS)) {
@@ -65,7 +65,7 @@ public class SecureTokenPlugin extends Plugin {
             String encoded = Base64.encodeToString(cipher.getIV(), Base64.NO_WRAP)
                     + ":"
                     + Base64.encodeToString(ciphertext, Base64.NO_WRAP);
-            if (!preferences().edit().putString(key, encoded).commit()) {
+            if (!preferences(getContext()).edit().putString(key, encoded).commit()) {
                 call.reject("secure storage write failed");
                 return;
             }
@@ -82,7 +82,7 @@ public class SecureTokenPlugin extends Plugin {
             call.reject("key is required");
             return;
         }
-        String encoded = preferences().getString(key, null);
+        String encoded = preferences(getContext()).getString(key, null);
         JSObject result = new JSObject();
         if (encoded == null) {
             result.put("value", null);
@@ -90,18 +90,26 @@ public class SecureTokenPlugin extends Plugin {
             return;
         }
         try {
-            String[] parts = encoded.split(":", 2);
-            if (parts.length != 2) throw new IllegalStateException("invalid encrypted value");
-            byte[] iv = Base64.decode(parts[0], Base64.NO_WRAP);
-            byte[] ciphertext = Base64.decode(parts[1], Base64.NO_WRAP);
-            Cipher cipher = Cipher.getInstance(TRANSFORMATION);
-            cipher.init(Cipher.DECRYPT_MODE, getOrCreateKey(), new GCMParameterSpec(128, iv));
-            String value = new String(cipher.doFinal(ciphertext), StandardCharsets.UTF_8);
-            result.put("value", value);
+            result.put("value", decryptStoredValue(encoded));
             call.resolve(result);
         } catch (Exception error) {
             call.reject("Android Keystore decryption failed", error);
         }
+    }
+
+    static String readStoredValue(Context context, String key) throws Exception {
+        String encoded = preferences(context).getString(key, null);
+        return encoded == null ? null : decryptStoredValue(encoded);
+    }
+
+    private static String decryptStoredValue(String encoded) throws Exception {
+        String[] parts = encoded.split(":", 2);
+        if (parts.length != 2) throw new IllegalStateException("invalid encrypted value");
+        byte[] iv = Base64.decode(parts[0], Base64.NO_WRAP);
+        byte[] ciphertext = Base64.decode(parts[1], Base64.NO_WRAP);
+        Cipher cipher = Cipher.getInstance(TRANSFORMATION);
+        cipher.init(Cipher.DECRYPT_MODE, getOrCreateKey(), new GCMParameterSpec(128, iv));
+        return new String(cipher.doFinal(ciphertext), StandardCharsets.UTF_8);
     }
 
     @PluginMethod
@@ -111,7 +119,7 @@ public class SecureTokenPlugin extends Plugin {
             call.reject("key is required");
             return;
         }
-        if (!preferences().edit().remove(key).commit()) {
+        if (!preferences(getContext()).edit().remove(key).commit()) {
             call.reject("secure storage delete failed");
             return;
         }

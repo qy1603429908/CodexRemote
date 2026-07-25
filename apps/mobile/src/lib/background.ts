@@ -11,7 +11,7 @@ export interface BackgroundAction {
 interface CodexBackgroundPluginApi {
   requestNotificationPermission(): Promise<{ granted: boolean }>;
   getStatus(): Promise<{ running: boolean; notificationsGranted: boolean; sdkInt: number }>;
-  start(options: { title?: string; text?: string; threadId?: string; action?: string }): Promise<{ running: boolean }>;
+  start(options: { title?: string; text?: string; threadId?: string; action?: string; serverUrl?: string }): Promise<{ running: boolean }>;
   update(options: { title?: string; text?: string; threadId?: string; action?: string }): Promise<{ running: boolean }>;
   stop(): Promise<{ running: boolean }>;
   notifyApproval(options: { threadId: string; title?: string; text?: string; action?: string; notificationId?: number }): Promise<void>;
@@ -33,6 +33,7 @@ export async function startBackgroundRuntime(config: RemoteConfig, threadId?: st
       text: `后台连接已启用 · ${new URL(config.serverUrl).host}`,
       threadId,
       action: threadId ? 'openThread' : 'openBackground',
+      serverUrl: config.serverUrl,
     });
     return true;
   } catch {

@@ -19,7 +19,7 @@
 | 1 | Android 后台运行；非当前任务出现审批时通知；完成事件通知 | 部分完成 | 原生前台服务、高优先级审批 channel、完成通知、点击动作持久化已实现；无 Android 真机，Doze/厂商省电未证明。 |
 | 2 | 手机与 Desktop GUI 同时打开同一任务，历史必须完整且持续同步 | 已完成 | 使用 `~/.codex/ipc/ipc.sock` follower 加载 Desktop canonical complete history；浏览器回归中本任务历史与最近 9 条用户反馈均可见。 |
 | 3 | 图片/文件上传、发送与下载 | 部分完成 | Host bearer 上传、一次性下载票据、Android 文件选择器/Downloads 实现和 HTTP 回环测试完成；真机 MediaStore 未证明。 |
-| 4 | 思考梗概不用气泡；运行时临时展示，带 Codex GUI 风格波动 | 已完成 | `TransientActivity` 固定槽位；状态字“思考梗概 · …”；4 条动画波形；浏览器 DOM 实测 wave bar=4。 |
+| 4 | 思考梗概不用气泡；运行时临时展示，带 Codex GUI 风格波动 | 已完成 | 仅显示当前 active turn 的梗概；canonical snapshot 会清理旧 synthetic tail；无当前 turn 时只显示“Codex 正在思考”，不复活缓存旧内容。 |
 | 5 | 目标/TODO 放在输入框上方，可展开；局部快照不能把它清掉 | 已完成 | 独立 `todoByThread` 状态；解析 Desktop `todo-list`；局部 reconciliation 保留最后确认 TODO；浏览器实时显示 7/9 项完成。 |
 | 6 | 新输出时阅读上文不能上下跳闪 | 已完成 | 仅接近底部时自动跟随；离开底部显示“有新内容”；固定 reasoning 槽位和 ResizeObserver 锚定。 |
 | 7 | 权限/审阅模式可选：完全访问、替我审阅、严格审阅等 | 已完成 | 支持 `auto`、`granular`、`read-only`、`guardian-approvals`、`full-access`；设置区显示真实当前值。 |
@@ -36,6 +36,9 @@
 | 18 | 上下文压缩必须显示请求、运行、重试、成功、失败和错误 | 已完成 | `thread.compaction.accepted` 只表示受理；结合 `contextCompaction`、`item/started`、`item/completed`、`error.willRetry`、`turn/completed` 驱动状态条和失败通知。 |
 | 19 | 手机发送后 Desktop 再发送不能卡死 GUI | 已完成（机制修复） | Desktop owner 一律 steer-first；只有明确 `SteerTurnInactiveError` 才 start；超时/断连不 fallback；避免追加第二个本地 `inProgress` turn。没有复现原卡死现场，因此“原事故根因”仍是高置信推断。 |
 | 20 | 已探测协议必须及时文档化 | 已完成 | `docs/desktop-ipc.md`、`docs/app-server-protocol.md` 与两份 live protocol raw log 已更新。 |
+| 27 | Desktop 可见但手机缺失 Subagent；Subagent 元数据跨来源一致 | 客户端侧完成，Host 索引待后续 | 客户端解析 `source/subAgent`、`source/subagent`、`source.original.*`，保留 parent/nickname，并从缓存协作文本恢复 ID；现场已证明 Singer 不在 Host `threads.list`，本 Android-only 分支按约束不改服务端。 |
+| 28 | Agent 工具调用直接显示 Subagent 跳转入口 | 已完成 | Agent 工具不进入普通连续工具折叠组；消息下方渲染可点击 Subagent chip，复用顶部详情交互。 |
+| 29 | Redmi 横屏左右显示切口不得遮挡会话内容 | 已完成（待真机） | 消息流、设置栏、思考梗概、上下文压缩栏、Subagent strip、TODO、队列、Git diff 均消费左右 safe-area；竖屏/横屏真机待验收。 |
 
 ## 当前交付 TODO
 
@@ -135,3 +138,19 @@
 - [x] 移除公开仓库中的私人部署配置、原始会话日志和截图；以可复现命令与脱敏摘要替代。
 - [x] 完成 v0.3.2 最终 APK 构建、lint、签名/元数据与隐私字符串验证；源码以 `v0.3.2` 标签发布，APK 通过 Gitea Release 附件分发。
 - [ ] 在真实 Android 设备确认打开该长会话 10 秒以上不再发生历史消息下沉。
+
+### v0.3.3 Android 系统栏与通知回归
+
+| # | 需求 / 缺陷 | 当前状态 | 验收标准 |
+|---|---|---|---|
+| 44 | Redmi K80 顶部标题栏进入状态栏/挖孔区域，底部输入区被三键或手势导航栏遮挡 | 已完成（自动化，待真机） | 使用 Capacitor 8 `SystemBars.insetsHandling=css` 注入的 `--safe-area-inset-*`，所有顶栏、输入栏、列表、bottom sheet、toast 和 Subagent 弹层统一消费上下左右安全区；不手写第二套原生 WindowInsets。 |
+| 45 | 任务完成、失败、审批和权限请求没有系统通知或提示音 | 已完成（事件到达客户端时；待真机） | 完成与人工介入事件即使在当前任务前台也产生通知；使用新的高优先级 v2 渠道和内置提示音；初始化失败/拒绝后允许重试，失败不得永久写入去重状态。 |
+| 46 | `waitingOnUserInput` 只显示状态，不通知用户 | 已完成（自动化，待真机） | `waiting_input` 与仅状态型 `waiting_approval` 进入时产生可点击的高优先级通知；状态退出或审批解决后取消占位通知；generation guard 会取消晚到的失效异步通知，显式审批不会与状态通知产生双重提示音；原生通知索引跨 Service 进程重建持久化并由全量快照清理。 |
+
+- [x] 修复后置 `.conversation-top-bar` 规则覆盖顶部安全区的问题。
+- [x] 使用 Capacitor 8 SystemBars CSS 变量兼容旧版 Android System WebView，并覆盖横屏左右挖孔安全区。
+- [x] 浅色 UI、启动背景、主题色和系统栏深色图标保持一致。
+- [x] 通知渠道升级为 `codex_approvals_v2` / `codex_completions_v2`，显式绑定内置 WAV 提示音和振动模式。
+- [x] 增加任务完成、审批、待输入、权限重试、重连快照补偿和安全区静态回归测试。
+- [x] 将只读事件连接迁入 Android 原生前台 Service；仅发送任务摘要请求，保活使用 WebSocket ping frame，不发送控制消息；与 WebView 使用相同通知 ID 去重。
+- [ ] Redmi K80 分别在三键导航/手势导航、前台/后台、锁屏场景完成真机验收。

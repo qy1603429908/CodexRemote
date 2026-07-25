@@ -58,8 +58,13 @@ export function isContextMessage(message: RemoteMessage): boolean {
   return itemType.includes('reasoning') || isPlan(message);
 }
 
-export function latestReasoning(messages: RemoteMessage[]): RemoteMessage | undefined {
-  return [...messages].reverse().find((message) => message.status === 'streaming' && message.itemType?.toLowerCase().includes('reasoning'));
+export function latestReasoning(messages: RemoteMessage[], currentTurnId?: string): RemoteMessage | undefined {
+  if (!currentTurnId) return undefined;
+  return [...messages].reverse().find((message) => {
+    const isReasoning = message.itemType?.toLowerCase().includes('reasoning');
+    const isDetail = message.toolName === '思考详情' || message.id.endsWith('_detail');
+    return message.turnId === currentTurnId && message.status === 'streaming' && isReasoning && !isDetail;
+  });
 }
 
 export function ConversationContextPanel({ thread, messages }: { thread: RemoteThread; messages: RemoteMessage[] }) {

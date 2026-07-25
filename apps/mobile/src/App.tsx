@@ -1,7 +1,6 @@
 import { App as CapacitorApp } from '@capacitor/app';
-import { Capacitor } from '@capacitor/core';
+import { Capacitor, SystemBars, SystemBarsStyle } from '@capacitor/core';
 import { LocalNotifications } from '@capacitor/local-notifications';
-import { StatusBar, Style } from '@capacitor/status-bar';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { ConversationScreen } from './components/ConversationScreen';
 import { NewThreadSheet } from './components/NewThreadSheet';
@@ -57,14 +56,16 @@ export function App() {
     void loadRemoteConfig().then(setConfig).catch(() => setConfig(null));
     void initializeNotifications();
     if (Capacitor.isNativePlatform()) {
-      void StatusBar.setStyle({ style: Style.Dark });
-      void StatusBar.setBackgroundColor({ color: '#f7f7f5' });
-      void StatusBar.setOverlaysWebView({ overlay: false });
+      void SystemBars.setStyle({ style: SystemBarsStyle.Light });
     }
   }, []);
 
   useEffect(() => {
-    if (!config || !Capacitor.isNativePlatform()) return;
+    if (config === undefined || !Capacitor.isNativePlatform()) return;
+    if (config === null) {
+      void CodexBackground.stop();
+      return;
+    }
     void startBackgroundRuntime(config, remote.selectedThreadId ?? undefined);
   }, [config]);
 
@@ -168,6 +169,7 @@ export function App() {
           phaseDetail={remote.phaseDetail}
           running={remote.running}
           canInterrupt={remote.canInterrupt}
+          currentTurnId={remote.selectedTurnId}
           historyHasMore={Boolean(remote.selectedHistory?.hasMore)}
           historyLoading={remote.historyLoading}
           selectedAgentId={selectedAgentByThread[remote.selectedThread.id] ?? null}

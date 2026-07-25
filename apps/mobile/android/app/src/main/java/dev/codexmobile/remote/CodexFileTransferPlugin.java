@@ -22,6 +22,7 @@ import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.net.URLDecoder;
+import java.util.Locale;
 
 @CapacitorPlugin(name = "CodexFileTransfer")
 public class CodexFileTransferPlugin extends Plugin {
@@ -113,12 +114,13 @@ public class CodexFileTransferPlugin extends Plugin {
 
     private static String responseFileName(String disposition, String fallback) {
         if (disposition == null) return fallback;
-        int encodedIndex = disposition.toLowerCase().indexOf("filename*=utf-8''");
+        String normalizedDisposition = disposition.toLowerCase(Locale.ROOT);
+        int encodedIndex = normalizedDisposition.indexOf("filename*=utf-8''");
         if (encodedIndex >= 0) {
             String value = disposition.substring(encodedIndex + 17).split(";", 2)[0];
             try { return sanitize(URLDecoder.decode(value, "UTF-8")); } catch (Exception ignored) { }
         }
-        int quotedIndex = disposition.toLowerCase().indexOf("filename=\"");
+        int quotedIndex = normalizedDisposition.indexOf("filename=\"");
         if (quotedIndex >= 0) {
             String value = disposition.substring(quotedIndex + 10);
             int end = value.indexOf('"');

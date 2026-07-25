@@ -3,47 +3,57 @@ import { CodexBackground } from './background';
 import { LocalNotifications } from '@capacitor/local-notifications';
 import type { WireApprovalRequest } from '../types/protocol';
 
-const EVENTS_CHANNEL = 'codex-events';
-const APPROVAL_CHANNEL = 'codex-approvals';
-let initialized = false;
-let permissionGranted = false;
+const COMPLETION_CHANNEL = 'codex_completions_v2';
+const APPROVAL_CHANNEL = 'codex_approvals_v2';
+const ALERT_SOUND = 'codex_notification.wav';
+let initializationPromise: Promise<boolean> | null = null;
 
 function notificationId(value: string): number {
   let hash = 0;
   for (let index = 0; index < value.length; index += 1) hash = ((hash << 5) - hash + value.charCodeAt(index)) | 0;
+  if (hash === -2147483648) return 1;
   return Math.abs(hash || 1);
 }
 
 export async function initializeNotifications(): Promise<boolean> {
   if (!Capacitor.isNativePlatform()) return false;
-  if (initialized) return permissionGranted;
-  initialized = true;
-  try {
-    let permissions = await LocalNotifications.checkPermissions();
-    if (permissions.display === 'prompt' || permissions.display === 'prompt-with-rationale') {
-      permissions = await LocalNotifications.requestPermissions();
+  if (initializationPromise) return initializationPromise;
+  initializationPromise = (async () => {
+    try {
+      let permissions = await LocalNotifications.checkPermissions();
+      if (permissions.display === 'prompt' || permissions.display === 'prompt-with-rationale') {
+        permissions = await LocalNotifications.requestPermissions();
+      }
+      if (permissions.display !== 'granted') return false;
+      await LocalNotifications.createChannel({
+        id: COMPLETION_CHANNEL,
+        name: 'Codex 任务事件',
+        description: '任务完成、失败和中断通知',
+        importance: 5,
+        visibility: 1,
+        vibration: true,
+        sound: ALERT_SOUND,
+      });
+      await LocalNotifications.createChannel({
+        id: APPROVAL_CHANNEL,
+        name: 'Codex 等待确认',
+        description: '命令、文件、权限审批和等待输入通知',
+        importance: 5,
+        visibility: 1,
+        vibration: true,
+        sound: ALERT_SOUND,
+      });
+      return true;
+    } catch {
+      return false;
     }
-    permissionGranted = permissions.display === 'granted';
-    if (!permissionGranted) return false;
-    await LocalNotifications.createChannel({
-      id: EVENTS_CHANNEL,
-      name: 'Codex 任务事件',
-      description: '任务完成、失败和中断通知',
-      importance: 3,
-      visibility: 1,
-    });
-    await LocalNotifications.createChannel({
-      id: APPROVAL_CHANNEL,
-      name: 'Codex 等待确认',
-      description: '命令、文件和权限审批通知',
-      importance: 5,
-      visibility: 1,
-      vibration: true,
-    });
-    return true;
-  } catch {
-    permissionGranted = false;
-    return false;
+  })();
+  try {
+    return await initializationPromise;
+  } finally {
+    // Notification permission/channel state can change while the WebView remains alive.
+    // Never permanently cache an early denial, startup race or vendor-specific failure.
+    initializationPromise = null;
   }
 }
 
@@ -52,11 +62,13 @@ export async function notifyTurnFinished(options: {
   threadTitle: string;
   status: string;
   durationMs?: number;
-}): Promise<void> {
-  if (!(await initializeNotifications())) return;
+  eventId?: string;
+}): Promise<boolean> {
+  if (!(await initializeNotifications())) return false;
   const status = options.status.toLowerCase();
   const title = status === 'failed' ? 'Codex 执行失败' : status === 'interrupted' ? 'Codex 已中断' : 'Codex 已完成';
   const duration = options.durationMs != null ? ` · ${formatDuration(options.durationMs)}` : '';
+  const id = notificationId(`turn:${options.threadId}:${options.eventId ?? 'latest'}`);
   if (Capacitor.isNativePlatform()) {
     try {
       await CodexBackground.notifyCompletion({
@@ -64,29 +76,36 @@ export async function notifyTurnFinished(options: {
         title,
         text: `${options.threadTitle}${duration}`,
         action: 'openThread',
+        notificationId: id,
       });
-      return;
+      return true;
     } catch {
       // Fall back to Capacitor LocalNotifications.
     }
   }
-  await LocalNotifications.schedule({
-    notifications: [{
-      id: notificationId(`turn:${options.threadId}`),
-      title,
-      body: `${options.threadTitle}${duration}`,
-      channelId: EVENTS_CHANNEL,
-      extra: { type: 'turn', threadId: options.threadId },
-    }],
-  });
+  try {
+    await LocalNotifications.schedule({
+      notifications: [{
+        id,
+        title,
+        body: `${options.threadTitle}${duration}`,
+        channelId: COMPLETION_CHANNEL,
+        sound: ALERT_SOUND,
+        extra: { type: 'turn', threadId: options.threadId },
+      }],
+    });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export async function notifyCompactionFailed(options: {
   threadId: string;
   threadTitle: string;
   message: string;
-}): Promise<void> {
-  if (!(await initializeNotifications())) return;
+}): Promise<boolean> {
+  if (!(await initializeNotifications())) return false;
   const title = 'Codex 上下文压缩失败';
   const body = `${options.threadTitle} · ${options.message}`;
   if (Capacitor.isNativePlatform()) {
@@ -97,59 +116,120 @@ export async function notifyCompactionFailed(options: {
         text: body,
         action: 'openThread',
       });
-      return;
+      return true;
     } catch {
       // Fall back to Capacitor LocalNotifications.
     }
   }
-  await LocalNotifications.schedule({
-    notifications: [{
-      id: notificationId(`compaction:${options.threadId}`),
-      title,
-      body,
-      largeBody: options.message,
-      channelId: EVENTS_CHANNEL,
-      extra: { type: 'compaction-failed', threadId: options.threadId },
-    }],
-  });
+  try {
+    await LocalNotifications.schedule({
+      notifications: [{
+        id: notificationId(`compaction:${options.threadId}`),
+        title,
+        body,
+        largeBody: options.message,
+        channelId: COMPLETION_CHANNEL,
+        sound: ALERT_SOUND,
+        extra: { type: 'compaction-failed', threadId: options.threadId },
+      }],
+    });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
-export async function notifyApprovalRequested(approval: WireApprovalRequest): Promise<void> {
-  if (!(await initializeNotifications())) return;
+export async function notifyApprovalRequested(approval: WireApprovalRequest): Promise<boolean> {
+  if (!(await initializeNotifications())) return false;
   const title = approval.method.includes('fileChange')
     ? 'Codex 等待文件修改确认'
     : approval.method.includes('permissions')
       ? 'Codex 请求额外权限'
       : 'Codex 等待命令确认';
+  const body = approval.command || approval.reason || approval.detail || '打开 App 查看详情并确认。';
+  const id = notificationId(`approval:${String(approval.requestId)}`);
   if (Capacitor.isNativePlatform()) {
     try {
       await CodexBackground.notifyApproval({
         threadId: approval.threadId || 'global',
         title,
-        text: approval.command || approval.reason || approval.detail || '打开 App 查看详情并确认。',
+        text: body,
         action: 'openApproval',
-        notificationId: notificationId(`approval:${String(approval.requestId)}`),
+        notificationId: id,
       });
-      return;
+      return true;
     } catch {
       // Fall back to Capacitor LocalNotifications.
     }
   }
-  await LocalNotifications.schedule({
-    notifications: [{
-      id: notificationId(`approval:${String(approval.requestId)}`),
-      title,
-      body: approval.command || approval.reason || approval.detail || '打开 App 查看详情并确认。',
-      largeBody: approval.detail || approval.command,
-      channelId: APPROVAL_CHANNEL,
-      extra: { type: 'approval', requestId: String(approval.requestId), threadId: approval.threadId },
-    }],
-  });
+  try {
+    await LocalNotifications.schedule({
+      notifications: [{
+        id,
+        title,
+        body,
+        largeBody: approval.detail || approval.command,
+        channelId: APPROVAL_CHANNEL,
+        sound: ALERT_SOUND,
+        extra: { type: 'approval', requestId: String(approval.requestId), threadId: approval.threadId },
+      }],
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function notifyThreadAttention(options: {
+  threadId: string;
+  threadTitle: string;
+  kind: 'approval' | 'input';
+}): Promise<boolean> {
+  if (!(await initializeNotifications())) return false;
+  const id = notificationId(`attention:${options.kind}:${options.threadId}`);
+  const title = options.kind === 'input' ? 'Codex 等待你的输入' : 'Codex 等待审批';
+  const body = `${options.threadTitle} · 打开 App 继续处理。`;
+  if (Capacitor.isNativePlatform()) {
+    try {
+      await CodexBackground.notifyApproval({
+        threadId: options.threadId,
+        title,
+        text: body,
+        action: options.kind === 'input' ? 'openThread' : 'openApproval',
+        notificationId: id,
+      });
+      return true;
+    } catch {
+      // Fall back to Capacitor LocalNotifications.
+    }
+  }
+  try {
+    await LocalNotifications.schedule({
+      notifications: [{
+        id,
+        title,
+        body,
+        channelId: APPROVAL_CHANNEL,
+        sound: ALERT_SOUND,
+        extra: { type: `attention-${options.kind}`, threadId: options.threadId },
+      }],
+    });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export async function cancelApprovalNotification(requestId: string | number): Promise<void> {
+  await cancelNotificationById(notificationId(`approval:${String(requestId)}`));
+}
+
+export async function cancelThreadAttentionNotification(threadId: string, kind: 'approval' | 'input'): Promise<void> {
+  await cancelNotificationById(notificationId(`attention:${kind}:${threadId}`));
+}
+
+async function cancelNotificationById(id: number): Promise<void> {
   if (!Capacitor.isNativePlatform()) return;
-  const id = notificationId(`approval:${String(requestId)}`);
   try {
     await CodexBackground.cancelNotification({ notificationId: id });
   } catch {

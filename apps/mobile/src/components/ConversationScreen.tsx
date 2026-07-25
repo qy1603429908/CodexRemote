@@ -28,6 +28,7 @@ interface ConversationScreenProps {
   phaseDetail: string;
   running: boolean;
   canInterrupt: boolean;
+  currentTurnId?: string;
   historyHasMore: boolean;
   historyLoading: boolean;
   selectedAgentId: string | null;
@@ -90,6 +91,28 @@ export function subagentsFromMessages(messages: RemoteMessage[]): Array<{ id: st
       mergeAgent({ id, label: id.slice(0, 8), state: message.status === 'streaming' ? 'active' : 'complete' });
     }
   }
+  // Compact mobile caches intentionally drop bulky raw event details. Recover the
+  // stable thread IDs from the rendered collaboration text so Subagent chips survive an
+  // app restart and a Desktop snapshot replacing the original tool payload.
+  for (const message of messages) {
+    const type = message.itemType?.toLowerCase() ?? '';
+    const name = message.toolName?.toLowerCase() ?? '';
+    if (!type.includes('collabagent') && !type.includes('subagent') && !name.includes('subagent')) continue;
+    const lines = message.content.split('\n');
+    const ids = new Set<string>();
+    for (const line of lines) {
+      const trimmed = line.trim();
+      const isActivity = type.includes('subagentactivity') || name === 'subagent 活动';
+      const isBareActivityId = isActivity && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(trimmed);
+      if (!trimmed.startsWith('Agent:') && !/^[0-9a-f]{8}-[0-9a-f-]{27}:\s/i.test(trimmed) && !isBareActivityId) continue;
+      for (const match of trimmed.matchAll(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi)) ids.add(match[0]!);
+    }
+    for (const id of ids) {
+      const stateLine = lines.find((line) => line.trimStart().startsWith(`${id}:`));
+      const state = stateLine?.slice(stateLine.indexOf(':') + 1).split('—')[0]?.trim();
+      mergeAgent({ id, label: id.slice(0, 8), state: state || (message.status === 'streaming' ? 'active' : 'unknown') });
+    }
+  }
   return [...agents.values()];
 }
 
@@ -134,7 +157,10 @@ export function groupConsecutiveToolMessages(messages: RemoteMessage[]): Convers
     pending = [];
   };
   for (const message of messages) {
-    if (message.role === 'tool') pending.push(message);
+    const type = message.itemType?.toLowerCase() ?? '';
+    const name = message.toolName?.toLowerCase() ?? '';
+    const isAgentTool = type.includes('collabagent') || type.includes('subagent') || name.includes('subagent');
+    if (message.role === 'tool' && !isAgentTool) pending.push(message);
     else {
       flush();
       entries.push({ type: 'message', message });
@@ -169,7 +195,7 @@ export function visibleConversationContentKey(
   return `${entryKey}::${approvalKey}`;
 }
 
-export function ConversationScreen({ thread, messages, subagents: threadSubagents, approvals, compaction, promptQueue, gitDiff, models, skills, selectedModel, selectedEffort, selectedPermissionMode, phase, phaseDetail, running, canInterrupt, historyHasMore, historyLoading, selectedAgentId, onSelectAgent, onBack, onLoadOlderHistory, onReconnect, onSend, onCancelQueuedPrompt, onPromoteQueuedPrompt, onResumePromptQueue, onRefreshGitDiff, onInterrupt, onSelectModel, onSelectEffort, onSelectPermissionMode, onResolveApproval, onDismissCompaction, onOpenThread, onLoadAttachment, onDownloadAttachment }: ConversationScreenProps) {
+export function ConversationScreen({ thread, messages, subagents: threadSubagents, approvals, compaction, promptQueue, gitDiff, models, skills, selectedModel, selectedEffort, selectedPermissionMode, phase, phaseDetail, running, canInterrupt, currentTurnId, historyHasMore, historyLoading, selectedAgentId, onSelectAgent, onBack, onLoadOlderHistory, onReconnect, onSend, onCancelQueuedPrompt, onPromoteQueuedPrompt, onResumePromptQueue, onRefreshGitDiff, onInterrupt, onSelectModel, onSelectEffort, onSelectPermissionMode, onResolveApproval, onDismissCompaction, onOpenThread, onLoadAttachment, onDownloadAttachment }: ConversationScreenProps) {
   const streamRef = useRef<HTMLElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
   const followingRef = useRef(true);
@@ -183,7 +209,7 @@ export function ConversationScreen({ thread, messages, subagents: threadSubagent
   const [now, setNow] = useState(Date.now());
 
   const visibleMessages = useMemo(() => messages.filter((message) => !isContextMessage(message)), [messages]);
-  const reasoning = useMemo(() => latestReasoning(messages), [messages]);
+  const reasoning = useMemo(() => latestReasoning(messages, currentTurnId), [currentTurnId, messages]);
   const conversationEntries = useMemo(() => groupConsecutiveToolMessages(visibleMessages), [visibleMessages]);
   const subagents = useMemo(() => {
     const combined = new Map<string, { id: string; label: string; state: string; thread?: RemoteThread }>();
@@ -392,7 +418,7 @@ export function ConversationScreen({ thread, messages, subagents: threadSubagent
               </div>
             )}
             {conversationEntries.map((entry) => entry.type === 'message' ? (
-              <MessageBubble key={entry.message.id} message={entry.message} onLoadAttachment={onLoadAttachment} onDownloadAttachment={onDownloadAttachment} />
+              <MessageBubble key={entry.message.id} message={entry.message} agentTargets={subagentsFromMessages([entry.message])} onOpenAgent={onOpenThread} onLoadAttachment={onLoadAttachment} onDownloadAttachment={onDownloadAttachment} />
             ) : (
               <details
                 className={`tool-call-group${entry.messages.some((message) => message.status === 'streaming') ? ' is-streaming' : ''}`}
@@ -417,7 +443,7 @@ export function ConversationScreen({ thread, messages, subagents: threadSubagent
                   <span className="tool-group-action">展开</span>
                 </summary>
                 <div className="tool-call-group-items">
-                  {entry.messages.map((message) => <MessageBubble key={message.id} message={message} onLoadAttachment={onLoadAttachment} onDownloadAttachment={onDownloadAttachment} />)}
+                  {entry.messages.map((message) => <MessageBubble key={message.id} message={message} agentTargets={subagentsFromMessages([message])} onOpenAgent={onOpenThread} onLoadAttachment={onLoadAttachment} onDownloadAttachment={onDownloadAttachment} />)}
                 </div>
               </details>
             ))}
@@ -453,10 +479,11 @@ export function ConversationScreen({ thread, messages, subagents: threadSubagent
               {selectedAgent.thread?.model && <><dt>模型</dt><dd>{selectedAgent.thread.model}{selectedAgent.thread.effort ? ` · ${selectedAgent.thread.effort}` : ''}</dd></>}
               <dt>任务 ID</dt><dd><code>{selectedAgent.id}</code></dd>
             </dl>
-            {selectedAgent.thread ? (
-              <button className="agent-open-thread" type="button" onClick={() => onOpenThread(selectedAgent.id)}>打开 Subagent 任务</button>
-            ) : (
-              <p className="agent-not-loaded">该 Subagent 只有活动记录，完整任务尚未载入；可在任务列表同步后打开。</p>
+            <button className="agent-open-thread" type="button" onClick={() => onOpenThread(selectedAgent.id)}>
+              {selectedAgent.thread ? '打开 Subagent 任务' : '按任务 ID 直接打开'}
+            </button>
+            {!selectedAgent.thread && (
+              <p className="agent-not-loaded">该 Subagent 尚未进入任务索引；客户端会使用活动记录中的任务 ID 直接向 Host 请求。</p>
             )}
           </section>
         </div>

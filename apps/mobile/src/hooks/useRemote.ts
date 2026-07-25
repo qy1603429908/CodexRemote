@@ -2,8 +2,9 @@ import { App as CapacitorApp } from '@capacitor/app';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { RemoteConfig } from '../lib/configStore';
 import { RemoteSocket } from '../lib/RemoteSocket';
-import { cancelApprovalNotification, notifyApprovalRequested, notifyCompactionFailed, notifyTurnFinished } from '../lib/notifications';
+import { cancelApprovalNotification, cancelThreadAttentionNotification, notifyApprovalRequested, notifyCompactionFailed, notifyThreadAttention, notifyTurnFinished } from '../lib/notifications';
 import { downloadHostFile, saveHostFile, uploadRemoteFile } from '../lib/fileTransfer';
+import { NotificationGenerationGuard, NotificationOperationQueue, settleGuardedNotification } from '../lib/notificationGuard';
 import { cacheScope, clearRemoteCache, loadRemoteCache, saveRemoteCache, type CachedHistoryState, type RemoteCacheSnapshot } from '../lib/remoteCache';
 import type {
   ApprovalDecision,
@@ -87,7 +88,23 @@ export function stateFromStatus(value: unknown): ThreadState {
   return 'unknown';
 }
 
+function subagentMetadataFromSource(sourceValue: unknown): { parentThreadId?: string; agentNickname?: string; agentRole?: string } {
+  const source = record(sourceValue);
+  const original = record(source?.original);
+  const candidates = [source, original].filter((value): value is UnknownRecord => Boolean(value));
+  for (const candidate of candidates) {
+    const subagent = record(candidate.subAgent) ?? record(candidate.sub_agent) ?? record(candidate.subagent);
+    const spawn = record(subagent?.thread_spawn) ?? record(subagent?.threadSpawn) ?? subagent;
+    const parentThreadId = stringValue(spawn?.parent_thread_id, spawn?.parentThreadId, subagent?.parent_thread_id, subagent?.parentThreadId);
+    const agentNickname = stringValue(spawn?.agent_nickname, spawn?.agentNickname, subagent?.agent_nickname, subagent?.agentNickname);
+    const agentRole = stringValue(spawn?.agent_role, spawn?.agentRole, subagent?.agent_role, subagent?.agentRole);
+    if (parentThreadId || agentNickname || agentRole) return { parentThreadId, agentNickname, agentRole };
+  }
+  return {};
+}
+
 function normalizeSummary(thread: ThreadSummary): RemoteThread {
+  const sourceMetadata = subagentMetadataFromSource(thread.source);
   return {
     id: thread.id,
     title: visibleUserText(thread.name || thread.preview || '未命名任务'),
@@ -97,9 +114,9 @@ function normalizeSummary(thread: ThreadSummary): RemoteThread {
     updatedAt: timestamp(thread.updatedAt),
     state: stateFromStatus(thread.status),
     unread: 0,
-    parentThreadId: thread.parentThreadId,
-    agentNickname: thread.agentNickname,
-    agentRole: thread.agentRole,
+    parentThreadId: thread.parentThreadId ?? sourceMetadata.parentThreadId ?? null,
+    agentNickname: thread.agentNickname ?? sourceMetadata.agentNickname ?? null,
+    agentRole: thread.agentRole ?? sourceMetadata.agentRole ?? null,
     source: thread.source,
   };
 }
@@ -118,6 +135,9 @@ export function mergeThreadSummaries(current: RemoteThread[], incoming: ThreadSu
       ...previous,
       ...summary,
       state: keepObservedState ? previous.state : summary.state,
+      parentThreadId: summary.parentThreadId ?? previous?.parentThreadId ?? null,
+      agentNickname: summary.agentNickname ?? previous?.agentNickname ?? null,
+      agentRole: summary.agentRole ?? previous?.agentRole ?? null,
       unread: previous?.unread ?? 0,
       currentTurnStartedAt: previous?.currentTurnStartedAt,
       lastTurnDurationMs: previous?.lastTurnDurationMs,
@@ -493,6 +513,14 @@ function knownTurnIds(messages: RemoteMessage[]): string[] {
   return [...new Set(messages.flatMap((message) => message.turnId ? [message.turnId] : []))].slice(-500);
 }
 
+export function turnIdsAfterSnapshot(current: Record<string, string>, threadId: string, currentTurnId?: string): Record<string, string> {
+  if (currentTurnId) return current[threadId] === currentTurnId ? current : { ...current, [threadId]: currentTurnId };
+  if (!(threadId in current)) return current;
+  const next = { ...current };
+  delete next[threadId];
+  return next;
+}
+
 export function reconcileMessages(
   current: RemoteMessage[],
   incoming: RemoteMessage[],
@@ -548,7 +576,21 @@ export function reconcileThreadSnapshot(current: RemoteMessage[], incoming: Remo
     // A Desktop snapshot is the canonical prefix for this turn. Only exact semantic
     // aliases of canonical messages are removed above; unmatched live items retain their
     // opaque IDs and stay in the event tail until a later snapshot includes them.
-    const eventTail = cleanedCurrent.filter((message) => message.turnId === turnId && !overlaps(message));
+    const canonicalHasReasoning = canonical.some((message) => message.itemType?.toLowerCase().includes('reasoning'));
+    const canonicalHasPlan = canonical.some((message) => {
+      const type = message.itemType?.toLowerCase() ?? '';
+      return type.includes('plan') || type.includes('todo');
+    });
+    const eventTail = cleanedCurrent.filter((message) => {
+      if (message.turnId !== turnId || overlaps(message)) return false;
+      const type = message.itemType?.toLowerCase() ?? '';
+      // Desktop snapshots are authoritative for transient reasoning/plan state. Event
+      // aliases often use synthetic IDs, so retaining an older unmatched delta after the
+      // canonical block makes the transient footer jump back to stale text.
+      if (canonicalHasReasoning && type.includes('reasoning')) return false;
+      if (canonicalHasPlan && (type.includes('plan') || type.includes('todo'))) return false;
+      return true;
+    });
     mergedByTurn.set(turnId, dedupeMessages([...canonical, ...eventTail]));
   }
 
@@ -620,9 +662,9 @@ export function normalizeThreadPayload(payload: unknown): {
       updatedAt: timestamp(threadData.updatedAt ?? threadData.updated_at),
       state: currentTurnId ? 'running' : stateFromStatus(threadData.threadRuntimeStatus ?? threadData.status),
       unread: 0,
-      parentThreadId: stringValue(threadData.parentThreadId) ?? null,
-      agentNickname: stringValue(threadData.agentNickname) ?? null,
-      agentRole: stringValue(threadData.agentRole) ?? null,
+      parentThreadId: stringValue(threadData.parentThreadId) ?? subagentMetadataFromSource(threadData.source).parentThreadId ?? null,
+      agentNickname: stringValue(threadData.agentNickname) ?? subagentMetadataFromSource(threadData.source).agentNickname ?? null,
+      agentRole: stringValue(threadData.agentRole) ?? subagentMetadataFromSource(threadData.source).agentRole ?? null,
       model: stringValue(record(threadData.latestThreadSettings)?.model, threadData.latestModel),
       effort: stringValue(record(threadData.latestThreadSettings)?.effort, threadData.latestReasoningEffort),
       permissionMode: permissionModeFromThread(threadData),
@@ -759,7 +801,12 @@ export function useRemote(config: RemoteConfig | null) {
   const threadsRef = useRef<RemoteThread[]>([]);
   const itemStartedAtRef = useRef<Record<string, number>>({});
   const notifiedApprovalIdsRef = useRef<Set<string>>(new Set());
-  const appActiveRef = useRef(true);
+  const notifiedTurnIdsRef = useRef<Set<string>>(new Set());
+  const attentionStateByThreadRef = useRef<Record<string, 'waiting_approval' | 'waiting_input'>>({});
+  const notifiedAttentionStateByThreadRef = useRef<Record<string, 'waiting_approval' | 'waiting_input'>>({});
+  const attentionNotificationTimersRef = useRef<Record<string, number>>({});
+  const notificationGuardRef = useRef(new NotificationGenerationGuard());
+  const notificationQueueRef = useRef(new NotificationOperationQueue());
   const [phase, setPhase] = useState<ConnectionPhase>('idle');
   const [phaseDetail, setPhaseDetail] = useState('');
   const [codexReady, setCodexReady] = useState(false);
@@ -852,10 +899,8 @@ export function useRemote(config: RemoteConfig | null) {
     const key = `${threadId}:${turnId ?? normalizedMessage}`;
     if (notifiedCompactionFailuresRef.current.has(key)) return;
     notifiedCompactionFailuresRef.current.add(key);
-    if (!appActiveRef.current || selectedThreadRef.current !== threadId) {
-      const threadTitle = threadsRef.current.find((thread) => thread.id === threadId)?.title ?? 'Codex 任务';
-      void notifyCompactionFailed({ threadId, threadTitle, message: normalizedMessage });
-    }
+    const threadTitle = threadsRef.current.find((thread) => thread.id === threadId)?.title ?? 'Codex 任务';
+    void notifyCompactionFailed({ threadId, threadTitle, message: normalizedMessage });
   }, [updateCompactionStatus]);
 
   const observeCompactionSnapshot = useCallback((payload: unknown, threadId: string) => {
@@ -904,14 +949,117 @@ export function useRemote(config: RemoteConfig | null) {
   }, [reportCompactionFailure, updateCompactionStatus]);
 
   const updateThreadState = useCallback((threadId: string, state: ThreadState) => {
-    setThreads((current) =>
-      sortThreads(
+    setThreads((current) => {
+      const updated = sortThreads(
         current.map((thread) =>
           thread.id === threadId ? { ...thread, state, updatedAt: Date.now() } : thread,
         ),
-      ),
+      );
+      threadsRef.current = updated;
+      return updated;
+    });
+  }, []);
+
+  const queueAttentionCancellation = useCallback((threadId: string, kind: 'approval' | 'input') => {
+    return notificationQueueRef.current.run(
+      `attention:${kind}:${threadId}`,
+      () => cancelThreadAttentionNotification(threadId, kind),
     );
   }, []);
+
+  const queueApprovalCancellation = useCallback((requestId: string | number) => {
+    return notificationQueueRef.current.run(
+      `approval:${String(requestId)}`,
+      () => cancelApprovalNotification(requestId),
+    );
+  }, []);
+
+  const clearThreadAttentionNotification = useCallback((threadId: string) => {
+    notificationGuardRef.current.invalidate(`attention:${threadId}`);
+    const pendingTimer = attentionNotificationTimersRef.current[threadId];
+    if (pendingTimer !== undefined) window.clearTimeout(pendingTimer);
+    delete attentionNotificationTimersRef.current[threadId];
+    delete attentionStateByThreadRef.current[threadId];
+    delete notifiedAttentionStateByThreadRef.current[threadId];
+    // Both IDs are deterministic. Cancelling both also cleans a notification delivered
+    // after an earlier async schedule crossed this state transition.
+    void queueAttentionCancellation(threadId, 'approval');
+    void queueAttentionCancellation(threadId, 'input');
+  }, [queueAttentionCancellation]);
+
+  const updateAttentionNotification = useCallback((threadId: string, state: ThreadState) => {
+    if (state !== 'waiting_approval' && state !== 'waiting_input') {
+      clearThreadAttentionNotification(threadId);
+      return;
+    }
+
+    if (state === 'waiting_approval' && approvalsRef.current.some((approval) => approval.threadId === threadId)) {
+      const pending = attentionNotificationTimersRef.current[threadId];
+      if (pending !== undefined) window.clearTimeout(pending);
+      delete attentionNotificationTimersRef.current[threadId];
+      attentionStateByThreadRef.current[threadId] = state;
+      return;
+    }
+
+    const previous = attentionStateByThreadRef.current[threadId];
+    const pendingTimer = attentionNotificationTimersRef.current[threadId];
+    const alreadyNotified = notifiedAttentionStateByThreadRef.current[threadId] === state;
+    if (previous === state && (pendingTimer !== undefined || alreadyNotified)) return;
+
+    if (pendingTimer !== undefined) window.clearTimeout(pendingTimer);
+    delete attentionNotificationTimersRef.current[threadId];
+    const previouslyNotified = notifiedAttentionStateByThreadRef.current[threadId];
+    if (previouslyNotified && previouslyNotified !== state) {
+      void queueAttentionCancellation(threadId, previouslyNotified === 'waiting_input' ? 'input' : 'approval');
+      delete notifiedAttentionStateByThreadRef.current[threadId];
+    }
+
+    attentionStateByThreadRef.current[threadId] = state;
+    const kind = state === 'waiting_input' ? 'input' : 'approval';
+    const ticket = notificationGuardRef.current.begin(`attention:${threadId}`);
+    const showNotification = () => {
+      if (!notificationGuardRef.current.isCurrent(ticket) || attentionStateByThreadRef.current[threadId] !== state) return;
+      const threadTitle = threadsRef.current.find((thread) => thread.id === threadId)?.title ?? 'Codex 任务';
+      void settleGuardedNotification({
+        guard: notificationGuardRef.current,
+        ticket,
+        queue: notificationQueueRef.current,
+        operationKey: `attention:${kind}:${threadId}`,
+        schedule: () => notifyThreadAttention({ threadId, threadTitle, kind }),
+        isRelevant: () => attentionStateByThreadRef.current[threadId] === state
+          && !(kind === 'approval' && approvalsRef.current.some((approval) => approval.threadId === threadId)),
+        cancel: () => cancelThreadAttentionNotification(threadId, kind),
+      }).then((result) => {
+        if (result === 'stale') return;
+        if (result === 'shown') {
+          notifiedAttentionStateByThreadRef.current[threadId] = state;
+          return;
+        }
+        delete notifiedAttentionStateByThreadRef.current[threadId];
+        setLastError('Android 通知未能发送，请检查通知权限及通知分类的声音设置');
+      });
+    };
+    if (kind === 'approval') {
+      // A detailed approval event normally follows the coarse waiting status. Delay the
+      // fallback briefly; repeated snapshots must not keep cancelling the same timer.
+      attentionNotificationTimersRef.current[threadId] = window.setTimeout(() => {
+        delete attentionNotificationTimersRef.current[threadId];
+        showNotification();
+      }, 2_000);
+    } else {
+      showNotification();
+    }
+  }, [clearThreadAttentionNotification, queueAttentionCancellation]);
+
+  const replaceThreadsAndSyncAttention = useCallback((nextThreads: RemoteThread[]) => {
+    const nextIds = new Set(nextThreads.map((thread) => thread.id));
+    for (const threadId of Object.keys(attentionStateByThreadRef.current)) {
+      if (!nextIds.has(threadId)) clearThreadAttentionNotification(threadId);
+    }
+    threadsRef.current = nextThreads;
+    setThreads(nextThreads);
+    for (const thread of nextThreads) updateAttentionNotification(thread.id, thread.state);
+  }, [clearThreadAttentionNotification, updateAttentionNotification]);
 
   const appendDelta = useCallback(
     (threadId: string, turnId: string | undefined, itemId: string, delta: string, role: RemoteMessage['role'], toolName?: string, itemType?: string) => {
@@ -954,34 +1102,43 @@ export function useRemote(config: RemoteConfig | null) {
           observeCompactionSnapshot({ thread: params.thread }, normalized.thread.id);
           const latestTodo = latestPlanMessage(normalized.messages);
           if (latestTodo) setTodoByThread((current) => ({ ...current, [normalized.thread!.id]: latestTodo }));
-          setThreads((current) => sortThreads(upsertById(current, normalized.thread!)));
+          replaceThreadsAndSyncAttention(sortThreads(upsertById(threadsRef.current, normalized.thread!)));
           if (selectedThreadRef.current === normalized.thread.id) {
             setMessagesByThread((current) => ({ ...current, [normalized.thread!.id]: reconcileThreadSnapshot(current[normalized.thread!.id] ?? [], normalized.messages) }));
             if (normalized.thread.model) setSelectedModelState(normalized.thread.model);
             if (normalized.thread.effort) setSelectedEffortState(normalized.thread.effort);
             if (normalized.thread.permissionMode) setSelectedPermissionModeState(normalized.thread.permissionMode);
-            if (normalized.currentTurnId) setTurnIds((current) => ({ ...current, [normalized.thread!.id]: normalized.currentTurnId! }));
+            setTurnIds((current) => turnIdsAfterSnapshot(current, normalized.thread!.id, normalized.currentTurnId));
           }
         }
         return;
       }
       if (method === 'thread/status/changed' && threadId) {
-        updateThreadState(threadId, stateFromStatus(params?.status));
+        const nextState = stateFromStatus(params?.status);
+        updateThreadState(threadId, nextState);
+        updateAttentionNotification(threadId, nextState);
+        if (!['running', 'waiting_approval', 'waiting_input'].includes(nextState)) {
+          setTurnIds((current) => turnIdsAfterSnapshot(current, threadId));
+        }
         return;
       }
       if (method === 'thread/tokenUsage/updated' && threadId) {
         const tokenUsage = record(params?.tokenUsage);
         const total = record(tokenUsage?.total);
         if (total) {
-          setThreads((current) => current.map((thread) => thread.id === threadId ? {
-            ...thread,
-            tokenUsage: {
-              totalTokens: Number(total.totalTokens ?? 0),
-              inputTokens: Number(total.inputTokens ?? 0),
-              outputTokens: Number(total.outputTokens ?? 0),
-              reasoningOutputTokens: Number(total.reasoningOutputTokens ?? 0),
-            },
-          } : thread));
+          setThreads((current) => {
+            const updated = current.map((thread) => thread.id === threadId ? {
+              ...thread,
+              tokenUsage: {
+                totalTokens: Number(total.totalTokens ?? 0),
+                inputTokens: Number(total.inputTokens ?? 0),
+                outputTokens: Number(total.outputTokens ?? 0),
+                reasoningOutputTokens: Number(total.reasoningOutputTokens ?? 0),
+              },
+            } : thread);
+            threadsRef.current = updated;
+            return updated;
+          });
         }
         return;
       }
@@ -994,7 +1151,12 @@ export function useRemote(config: RemoteConfig | null) {
           compactionTurnIdsRef.current[threadId].add(turnId);
           updateCompactionStatus(threadId, { phase: 'running', startedAt, turnId, automatic: !compactionsRef.current[threadId] });
         }
-        setThreads((current) => current.map((thread) => thread.id === threadId ? { ...thread, state: 'running', currentTurnStartedAt: startedAt } : thread));
+        setThreads((current) => {
+          const updated = current.map((thread) => thread.id === threadId ? { ...thread, state: 'running' as const, currentTurnStartedAt: startedAt } : thread);
+          threadsRef.current = updated;
+          return updated;
+        });
+        updateAttentionNotification(threadId, 'running');
         return;
       }
       if (method === 'turn/completed' && threadId) {
@@ -1020,13 +1182,18 @@ export function useRemote(config: RemoteConfig | null) {
           return next;
         });
         const durationMs = typeof turn?.durationMs === 'number' ? turn.durationMs : undefined;
-        setThreads((current) => current.map((thread) => thread.id === threadId ? {
-          ...thread,
-          state: failed ? 'error' : 'idle',
-          currentTurnStartedAt: undefined,
-          lastTurnDurationMs: durationMs,
-          updatedAt: Date.now(),
-        } : thread));
+        const completedThreadState: ThreadState = failed ? 'error' : 'idle';
+        setThreads((current) => {
+          const updated = current.map((thread) => thread.id === threadId ? {
+            ...thread,
+            state: completedThreadState,
+            currentTurnStartedAt: undefined,
+            lastTurnDurationMs: durationMs,
+            updatedAt: Date.now(),
+          } : thread);
+          threadsRef.current = updated;
+          return updated;
+        });
         setMessagesByThread((current) => {
           const completed = (current[threadId] ?? []).map((message) =>
             message.status === 'streaming'
@@ -1048,14 +1215,25 @@ export function useRemote(config: RemoteConfig | null) {
         });
         if (failed && errorText && !isCompactionTurn) setLastError(errorText);
         const threadTitle = threadsRef.current.find((thread) => thread.id === threadId)?.title ?? 'Codex 任务';
-        if (!isCompactionTurn && (!appActiveRef.current || selectedThreadRef.current !== threadId)) {
-          void notifyTurnFinished({
-            threadId,
-            threadTitle,
-            status: String(turn?.status ?? (failed ? 'failed' : 'completed')),
-            durationMs,
-          });
+        if (!isCompactionTurn) {
+          const notificationKey = `${threadId}:${turnId ?? String(turn?.completedAt ?? turn?.startedAt ?? '')}`;
+          if (!notifiedTurnIdsRef.current.has(notificationKey)) {
+            notifiedTurnIdsRef.current.add(notificationKey);
+            void notifyTurnFinished({
+              threadId,
+              threadTitle,
+              status: String(turn?.status ?? (failed ? 'failed' : 'completed')),
+              durationMs,
+              eventId: turnId ?? String(turn?.completedAt ?? turn?.startedAt ?? 'latest'),
+            }).then((shown) => {
+              if (!shown) {
+                notifiedTurnIdsRef.current.delete(notificationKey);
+                setLastError('Android 通知未能发送，请检查通知权限及通知分类的声音设置');
+              }
+            });
+          }
         }
+        clearThreadAttentionNotification(threadId);
         return;
       }
       if (method === 'error' && threadId) {
@@ -1206,7 +1384,7 @@ export function useRemote(config: RemoteConfig | null) {
         appendDelta(threadId, turnId, itemId, textFromContent(params?.delta), 'tool', '命令输出');
       }
     },
-    [appendDelta, observeCompactionSnapshot, reportCompactionFailure, updateCompactionStatus, updateThreadState],
+    [appendDelta, clearThreadAttentionNotification, observeCompactionSnapshot, replaceThreadsAndSyncAttention, reportCompactionFailure, updateAttentionNotification, updateCompactionStatus, updateThreadState],
   );
 
   const handleMessage = useCallback(
@@ -1241,7 +1419,7 @@ export function useRemote(config: RemoteConfig | null) {
           setPhaseDetail(message.codexReady ? '' : 'Bridge 已连接，但 Codex app-server 尚未就绪');
           const serverChanged = Boolean(serverIdRef.current && serverIdRef.current !== message.serverId);
           if (serverChanged) {
-            setThreads([]);
+            replaceThreadsAndSyncAttention([]);
             setMessagesByThread({});
             setHistoryByThread({});
             threadIndexVersionRef.current = 0;
@@ -1293,21 +1471,23 @@ export function useRemote(config: RemoteConfig | null) {
             setLastError(detail);
           }
           break;
-        case 'threads':
-          setThreads((current) => mergeThreadSummaries(current, message.threads, true));
+        case 'threads': {
+          replaceThreadsAndSyncAttention(mergeThreadSummaries(threadsRef.current, message.threads, true));
           break;
-        case 'threads.snapshot':
+        }
+        case 'threads.snapshot': {
           threadIndexVersionRef.current = message.version;
-          setThreads((current) => mergeThreadSummaries(current, message.threads, true));
+          replaceThreadsAndSyncAttention(mergeThreadSummaries(threadsRef.current, message.threads, true));
           break;
+        }
         case 'threads.delta':
           if (message.baseVersion !== threadIndexVersionRef.current) {
             socketRef.current?.send({ type: 'threads.sync', requestId: createRequestId('threads-resync') });
             break;
           }
           threadIndexVersionRef.current = message.version;
-          setThreads((current) => mergeThreadSummaries(
-            current.filter((thread) => !message.removedIds.includes(thread.id)),
+          replaceThreadsAndSyncAttention(mergeThreadSummaries(
+            threadsRef.current.filter((thread) => !message.removedIds.includes(thread.id)),
             message.upserts,
             false,
           ));
@@ -1362,7 +1542,7 @@ export function useRemote(config: RemoteConfig | null) {
           observeCompactionSnapshot(message.thread, normalized.thread.id);
           const latestTodo = latestPlanMessage(normalized.messages);
           if (latestTodo) setTodoByThread((current) => ({ ...current, [normalized.thread!.id]: latestTodo }));
-          setThreads((current) => sortThreads(upsertById(current, normalized.thread!)));
+          replaceThreadsAndSyncAttention(sortThreads(upsertById(threadsRef.current, normalized.thread!)));
           setMessagesByThread((current) => ({
             ...current,
             [normalized.thread!.id]: reconcileMessages(current[normalized.thread!.id] ?? [], normalized.messages),
@@ -1372,9 +1552,7 @@ export function useRemote(config: RemoteConfig | null) {
             [normalized.thread!.id]: { ...message.history!, loaded: true },
           }));
           setHistoryLoadingByThread((current) => ({ ...current, [normalized.thread!.id]: false }));
-          if (normalized.currentTurnId) {
-            setTurnIds((current) => ({ ...current, [normalized.thread!.id]: normalized.currentTurnId! }));
-          }
+          setTurnIds((current) => turnIdsAfterSnapshot(current, normalized.thread!.id, normalized.currentTurnId));
           if (normalized.thread.model) setSelectedModelState(normalized.thread.model);
           if (normalized.thread.effort) setSelectedEffortState(normalized.thread.effort);
           if (normalized.thread.permissionMode) setSelectedPermissionModeState(normalized.thread.permissionMode);
@@ -1396,6 +1574,7 @@ export function useRemote(config: RemoteConfig | null) {
           const turnId = stringValue(turn?.id, turn?.turnId);
           if (turnId) setTurnIds((current) => ({ ...current, [message.threadId]: turnId }));
           updateThreadState(message.threadId, 'running');
+          updateAttentionNotification(message.threadId, 'running');
           break;
         }
         case 'event':
@@ -1403,24 +1582,61 @@ export function useRemote(config: RemoteConfig | null) {
           break;
         case 'approval': {
           const normalized = normalizeApproval(message.approval);
-          setApprovals((current) => upsertById(current, normalized));
+          setApprovals((current) => {
+            const next = upsertById(current, normalized);
+            approvalsRef.current = next;
+            return next;
+          });
           if (normalized.threadId) updateThreadState(normalized.threadId, 'waiting_approval');
           const notificationKey = String(message.approval.requestId);
+          if (normalized.threadId) {
+            notificationGuardRef.current.invalidate(`attention:${normalized.threadId}`);
+            const pendingTimer = attentionNotificationTimersRef.current[normalized.threadId];
+            if (pendingTimer !== undefined) window.clearTimeout(pendingTimer);
+            delete attentionNotificationTimersRef.current[normalized.threadId];
+            attentionStateByThreadRef.current[normalized.threadId] = 'waiting_approval';
+            delete notifiedAttentionStateByThreadRef.current[normalized.threadId];
+            // Cancel unconditionally: an older async coarse schedule may have posted before
+            // its Promise callback had a chance to record notifiedAttentionState.
+            void queueAttentionCancellation(normalized.threadId, 'approval');
+          }
           if (!notifiedApprovalIdsRef.current.has(notificationKey)) {
             notifiedApprovalIdsRef.current.add(notificationKey);
-            if (!appActiveRef.current || selectedThreadRef.current !== normalized.threadId) {
-              void notifyApprovalRequested(message.approval);
-            }
+            const ticket = notificationGuardRef.current.begin(`approval:${notificationKey}`);
+            void settleGuardedNotification({
+              guard: notificationGuardRef.current,
+              ticket,
+              queue: notificationQueueRef.current,
+              operationKey: `approval:${notificationKey}`,
+              schedule: () => notifyApprovalRequested(message.approval),
+              isRelevant: () => approvalsRef.current.some((approval) => String(approval.wireId) === notificationKey),
+              cancel: () => cancelApprovalNotification(notificationKey),
+            }).then((result) => {
+              if (result === 'shown') return;
+              notifiedApprovalIdsRef.current.delete(notificationKey);
+              if (result === 'failed') setLastError('Android 审批通知未能发送，请检查通知权限及通知分类的声音设置');
+            });
           }
           break;
         }
         case 'approval.resolved': {
           const resolved = approvalsRef.current.find((approval) => approval.wireId === message.approvalRequestId);
-          setApprovals((current) => current.filter((approval) => approval.wireId !== message.approvalRequestId));
-          notifiedApprovalIdsRef.current.delete(String(message.approvalRequestId));
-          void cancelApprovalNotification(message.approvalRequestId);
-          if (resolved?.threadId && turnIdsRef.current[resolved.threadId]) {
-            updateThreadState(resolved.threadId, 'running');
+          const remaining = approvalsRef.current.filter((approval) => approval.wireId !== message.approvalRequestId);
+          approvalsRef.current = remaining;
+          setApprovals(remaining);
+          const resolvedNotificationKey = String(message.approvalRequestId);
+          notificationGuardRef.current.invalidate(`approval:${resolvedNotificationKey}`);
+          notifiedApprovalIdsRef.current.delete(resolvedNotificationKey);
+          void queueApprovalCancellation(message.approvalRequestId);
+          if (resolved?.threadId) {
+            const stillWaiting = remaining.some((approval) => approval.threadId === resolved.threadId);
+            if (stillWaiting) {
+              attentionStateByThreadRef.current[resolved.threadId] = 'waiting_approval';
+              updateThreadState(resolved.threadId, 'waiting_approval');
+            } else {
+              clearThreadAttentionNotification(resolved.threadId);
+              if (turnIdsRef.current[resolved.threadId]) updateThreadState(resolved.threadId, 'running');
+            }
           }
           break;
         }
@@ -1436,7 +1652,7 @@ export function useRemote(config: RemoteConfig | null) {
       }
       if (typeof message.syncCursor === 'number') syncCursorRef.current = Math.max(syncCursorRef.current, message.syncCursor);
     },
-    [handleEvent, observeCompactionSnapshot, reportCompactionFailure, updateCompactionStatus, updateThreadState],
+    [clearThreadAttentionNotification, handleEvent, observeCompactionSnapshot, replaceThreadsAndSyncAttention, reportCompactionFailure, updateAttentionNotification, updateCompactionStatus, updateThreadState],
   );
   handleMessageRef.current = handleMessage;
 
@@ -1463,7 +1679,13 @@ export function useRemote(config: RemoteConfig | null) {
     setGitDiffByThread({});
     setApprovals([]);
     approvalsRef.current = [];
+    notificationGuardRef.current.reset();
     notifiedApprovalIdsRef.current.clear();
+    notifiedTurnIdsRef.current.clear();
+    for (const timer of Object.values(attentionNotificationTimersRef.current)) window.clearTimeout(timer);
+    attentionNotificationTimersRef.current = {};
+    attentionStateByThreadRef.current = {};
+    notifiedAttentionStateByThreadRef.current = {};
     setTurnIds({});
     turnIdsRef.current = {};
     setLastError('');
@@ -1479,6 +1701,7 @@ export function useRemote(config: RemoteConfig | null) {
       if (cancelled) return;
       if (cached) {
         setThreads(cached.threads);
+        threadsRef.current = cached.threads;
         setMessagesByThread(cached.messagesByThread);
         setHistoryByThread(cached.historyByThread);
         setSelectedThreadId(cached.selectedThreadId);
@@ -1489,6 +1712,7 @@ export function useRemote(config: RemoteConfig | null) {
         threadIndexVersionRef.current = cached.threadIndexVersion;
       } else {
         setThreads([]);
+        threadsRef.current = [];
         setMessagesByThread({});
         setHistoryByThread({});
         setSelectedThreadId(null);
@@ -1515,8 +1739,14 @@ export function useRemote(config: RemoteConfig | null) {
       socket.connect();
 
       appListener = await CapacitorApp.addListener('appStateChange', ({ isActive }) => {
-        appActiveRef.current = isActive;
-        if (isActive) socket?.reconnectNow();
+        if (isActive) {
+          socket?.reconnectNow();
+          for (const thread of threadsRef.current) {
+            if (thread.state === 'waiting_approval' || thread.state === 'waiting_input') {
+              updateAttentionNotification(thread.id, thread.state);
+            }
+          }
+        }
       });
       if (cancelled) void appListener.remove();
     })();
@@ -1527,7 +1757,7 @@ export function useRemote(config: RemoteConfig | null) {
       if (socketRef.current === socket) socketRef.current = null;
       void appListener?.remove();
     };
-  }, [config]);
+  }, [config, updateAttentionNotification]);
 
   useEffect(() => {
     if (!config || !cacheHydratedRef.current || !cacheScopeRef.current) return;
@@ -1845,12 +2075,12 @@ export function useRemote(config: RemoteConfig | null) {
     if (sent) {
       setApprovals((current) => current.filter((candidate) => candidate.id !== approvalId));
       notifiedApprovalIdsRef.current.delete(String(approval.wireId));
-      void cancelApprovalNotification(approval.wireId);
+      void queueApprovalCancellation(approval.wireId);
       if (approval.threadId && turnIdsRef.current[approval.threadId]) {
         updateThreadState(approval.threadId, 'running');
       }
     }
-  }, [approvals, updateThreadState]);
+  }, [approvals, queueApprovalCancellation, updateThreadState]);
 
   const startThread = useCallback((cwd: string, model?: string, modelProvider?: string) => {
     const normalizedCwd = cwd.trim();
@@ -1946,7 +2176,13 @@ export function useRemote(config: RemoteConfig | null) {
     setGitDiffByThread({});
     setApprovals([]);
     approvalsRef.current = [];
+    notificationGuardRef.current.reset();
     notifiedApprovalIdsRef.current.clear();
+    notifiedTurnIdsRef.current.clear();
+    for (const timer of Object.values(attentionNotificationTimersRef.current)) window.clearTimeout(timer);
+    attentionNotificationTimersRef.current = {};
+    attentionStateByThreadRef.current = {};
+    notifiedAttentionStateByThreadRef.current = {};
     setTurnIds({});
     turnIdsRef.current = {};
     itemStartedAtRef.current = {};
@@ -2015,6 +2251,7 @@ export function useRemote(config: RemoteConfig | null) {
     selectedPromptQueue,
     selectedGitDiff,
     selectedSubagents,
+    selectedTurnId: selectedThreadId ? turnIds[selectedThreadId] : undefined,
     selectedApprovals,
     running,
     canInterrupt,

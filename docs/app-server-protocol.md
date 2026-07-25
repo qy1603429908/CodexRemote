@@ -316,7 +316,9 @@ Subagent 列表不能依赖默认查询。`sourceKinds` 省略/为空时只返�
 }
 ```
 
-因此父子归组优先使用非空 `parentThreadId`，并兼容 `source.subAgent.thread_spawn.parent_thread_id`。当前 gateway 已显式请求全部 Subagent `sourceKinds` 并实现这两种父任务字段的兼容映射。
+因此父子归组优先使用非空 `parentThreadId`，并兼容 `source.subAgent.thread_spawn.parent_thread_id`。当前 gateway 的初次索引查询会显式请求全部 Subagent `sourceKinds` 并实现这两种父任务字段的兼容映射。
+
+**现场限制（2026-07-25）**：Desktop 运行中后创建的 Subagent 可能尚未进入 Host 的 `threads.list` 增量索引；Singer 即出现“Desktop 可见、`thread.open(<id>)` 成功、但 `threads.list` 缺失”的情况。Android v0.3.3 客户端会从父任务协作活动中恢复 Subagent ID，并支持按 ID 直接打开；若 Host 从未向客户端发送过该 ID，纯客户端无法凭空发现，需后续修复 Host 索引刷新。
 
 ---
 
@@ -1150,9 +1152,10 @@ turn/start(request)
 
 可靠性边界：
 
-- App/WebSocket 实际收到事件时，才能调度通知；
-- App 被系统休眠、杀死、断网或 bridge 离线期间，不能保证通知；
-- 重连后当前没有查询并补发错过完成事件的机制；
+- v0.3.3 起，WebView 与 Android 前台 Service 内的只读原生 WebSocket 都能接收完成/审批/等待输入事件；两条路径使用相同通知 ID 去重；
+- 原生连接只发送 `threads.list` 应用消息；保活使用 OkHttp WebSocket ping frame，不发送 `ping` 应用消息或任何控制消息，也不改变 Desktop owner 或审批归属；
+- Android 强行停止、设备断网、bridge 离线或厂商阻止前台服务重建期间仍不能保证通知；
+- 没有服务端离线完成事件补发队列；断线期间已经完成且重连后只剩 idle 的事件可能无法恢复；
 - 文件审批收到后续 Diff 时会再次广播同一个 approval；移动端按 request ID 去重通知，同时继续更新审批卡片内容；
 - 这些行为尚未经过 Android 真机验证。
 

@@ -83,7 +83,8 @@ public class CodexBackgroundPlugin extends Plugin {
                     call.getString("title"),
                     call.getString("text"),
                     call.getString("threadId"),
-                    defaultValue(call.getString("action"), "openBackground"));
+                    defaultValue(call.getString("action"), "openBackground"),
+                    call.getString("serverUrl"));
             JSObject result = new JSObject();
             result.put("running", true);
             call.resolve(result);
@@ -148,6 +149,7 @@ public class CodexBackgroundPlugin extends Plugin {
                 NotificationCompat.PRIORITY_HIGH,
                 NotificationCompat.CATEGORY_EVENT,
                 true);
+        new CodexNotificationLedger(getContext()).putNotification(id, threadId);
         resolveNotification(call, id, "approval", threadId);
     }
 
@@ -172,9 +174,9 @@ public class CodexBackgroundPlugin extends Plugin {
                 title,
                 text,
                 id,
-                NotificationCompat.PRIORITY_DEFAULT,
-                NotificationCompat.CATEGORY_STATUS,
-                false);
+                NotificationCompat.PRIORITY_HIGH,
+                NotificationCompat.CATEGORY_EVENT,
+                true);
         resolveNotification(call, id, "completion", threadId);
     }
 
@@ -189,6 +191,7 @@ public class CodexBackgroundPlugin extends Plugin {
         }
         int id = explicitId == null ? notificationId(kind, threadId, null) : explicitId;
         NotificationManagerCompat.from(getContext()).cancel(id);
+        new CodexNotificationLedger(getContext()).removeNotification(id);
         call.resolve();
     }
 
@@ -235,7 +238,7 @@ public class CodexBackgroundPlugin extends Plugin {
             int notificationId,
             int priority,
             String category,
-            boolean approval) {
+            boolean alert) {
         CodexNotificationChannels.ensureCreated(getContext());
         Intent activityIntent = new Intent(getContext(), MainActivity.class)
                 .setAction(Intent.ACTION_MAIN)
@@ -257,10 +260,10 @@ public class CodexBackgroundPlugin extends Plugin {
                 .setPriority(priority)
                 .setCategory(category)
                 .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
-                .setOnlyAlertOnce(false)
+                .setOnlyAlertOnce(true)
                 .setGroup("codex-thread-" + threadId);
-        if (approval) {
-            builder.setDefaults(Notification.DEFAULT_VIBRATE);
+        if (alert && Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+            builder.setDefaults(Notification.DEFAULT_SOUND | Notification.DEFAULT_VIBRATE);
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
                 && ContextCompat.checkSelfPermission(getContext(), Manifest.permission.POST_NOTIFICATIONS)
