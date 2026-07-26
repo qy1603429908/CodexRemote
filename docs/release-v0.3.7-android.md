@@ -43,4 +43,4 @@ v0.3.7 改为按稳定 notificationId 原子认领：前台 WebView 与后台 So
 - `versionCode`：`11`
 - APK：`apps/mobile/artifacts/codex-mobile-remote-v0.3.7-debug.apk`
 - SHA-256：`807591cf75e5a1c30ee6fb807c4ea659fbe3496f2413642506e9a1d590333fb9`
-- 发布地址：`https://git.qinmouren.cn/QinYuAdmin/CodexRemote/releases/tag/v0.3.7`
+- GitHub Release：`https://github.com/qy1603429908/CodexRemote/releases/tag/v0.3.7`

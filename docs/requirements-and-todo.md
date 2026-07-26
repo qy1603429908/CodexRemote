@@ -214,7 +214,7 @@
 - [x] 精确/观察时间一旦得到，不允许后续缺少 item 时间的 Desktop snapshot 回退覆盖。
 - [x] Redmi Note 14 Pro+ 真机验证：Agent 标签与 `Subagent · sendInput` 同一行；旧工具不显示伪 `12:53`；在线新增工具显示 `≈15:38`、`≈15:39`。
 - [x] 移动端 TypeScript 类型检查与 12 个测试文件、160 项测试通过。
-- [x] 在独立目录 `/Users/qinyu/codex-computer-use-approval-test` 创建新任务并证明权限映射：`granular` turn 原始策略为 managed workspace-write，但 `sandbox_approval=false`，没有产生审批；`auto` turn 原始策略为 `approval_policy=on-request`，产生真实 `item/commandExecution/requestApproval`，手机收到 `codex_approvals_v4` 通知和审批音。
+- [x] 在独立临时工作目录创建新任务并证明权限映射：`granular` turn 原始策略为 managed workspace-write，但 `sandbox_approval=false`，没有产生审批；`auto` turn 原始策略为 `approval_policy=on-request`，产生真实 `item/commandExecution/requestApproval`，手机收到 `codex_approvals_v4` 通知和审批音。
 - [x] 原生 Computer Use 工具审批已证明：Host 自动探测 ChatGPT/Codex 随包 Node REPL runtime，声明 MCP form elicitation 能力；Redmi 真机显示 `mcpServer/elicitation/request` 审批，手机批准后原生 Computer Use 恢复并完成。
 - [x] 证明 app-server `thread.start` 新任务只进入 app-server/手机客户端任务索引，不会自动出现在 Desktop GUI：现有 Desktop IPC 仅支持跟随/启动已有 Desktop-owned thread，没有创建 GUI 任务的 IPC。
 - [x] 证明 16:11:04 的一字回复已有 rollout `task_complete`，但 Redmi logcat 没有对应 completion fallback；根因是 Desktop GUI 路径可只发 running→idle snapshot/status 而不发 `turn/completed`。

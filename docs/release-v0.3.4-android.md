@@ -70,7 +70,7 @@
 - APK 元数据：包名 `dev.codexmobile.remote`，`versionName=0.3.4`，`versionCode=8`，`minSdk=24`，`targetSdk=36`。
 - APK 签名：v2 校验通过。
 - APK 内容：包含 `res/raw/codex_notification.wav` 和 Web 入口资源。
-- 私密字符串扫描：未发现维护者私人域名、IP、用户名或 `/Users/qinyu` 绝对路径。
+- 私密字符串扫描：未发现维护者私人域名、IP、用户名或本机绝对路径。
 
 ## 真机待验收
 
@@ -89,4 +89,4 @@
 - APK 大小：约 `5.1 MiB`
 - 签名：Android debug certificate，APK Signature Scheme v2 验证通过
 - SHA-256：`35fa41287948ecff5f647001e08d0f76d3c99bdce615451cc2eedf203f0ca205`
-- Gitea Release：`https://git.qinmouren.cn/QinYuAdmin/CodexRemote/releases/tag/v0.3.4`
+- 发布标签：`v0.3.4`

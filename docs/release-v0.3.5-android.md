@@ -40,7 +40,7 @@ v0.3.4 的自动化测试通过，但 Redmi K80 真机仍报告长会话明显�
 - APK 元数据：包名 `dev.codexmobile.remote`，`versionName=0.3.5`，`versionCode=9`，`minSdk=24`，`targetSdk=36`。
 - APK 签名：Android debug certificate，APK Signature Scheme v2 验证通过。
 - APK 内容：包含通知声音和 Web 入口资源。
-- 私密字符串扫描：未发现维护者私人域名、IP、用户名、私钥文件名或 `/Users/qinyu` 绝对路径。
+- 私密字符串扫描：未发现维护者私人域名、IP、用户名、私钥文件名或本机绝对路径。
 - APK 大小：5,721,319 bytes。
 - SHA-256：`e48b8b2653fc942b7e37bb543a92276789d0fda2f0cbfd8c7ec068ea40d0e578`。
 
@@ -58,4 +58,4 @@ v0.3.4 的自动化测试通过，但 Redmi K80 真机仍报告长会话明显�
 - `versionName`：`0.3.5`
 - `versionCode`：`9`
 - Git 代码提交：`596fccc`
-- 发布地址：`https://git.qinmouren.cn/QinYuAdmin/CodexRemote/releases/tag/v0.3.5`
+- 发布标签：`v0.3.5`
