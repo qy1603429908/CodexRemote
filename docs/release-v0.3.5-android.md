@@ -57,4 +57,5 @@ v0.3.4 的自动化测试通过，但 Redmi K80 真机仍报告长会话明显�
 - APK：`apps/mobile/artifacts/codex-mobile-remote-v0.3.5-debug.apk`
 - `versionName`：`0.3.5`
 - `versionCode`：`9`
-- 发布渠道：Gitea Release `v0.3.5`
+- Git 代码提交：`596fccc`
+- 发布地址：`https://git.qinmouren.cn/QinYuAdmin/CodexRemote/releases/tag/v0.3.5`

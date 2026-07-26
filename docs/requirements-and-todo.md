@@ -196,4 +196,5 @@
 - [x] 为消息、工具组和审批卡增加 `content-visibility: auto`，减少 Android WebView 离屏布局/绘制。
 - [x] 删除思考梗概和 TODO 查找中的数组复制/reverse。
 - [x] 增加 5000 条消息派生、固定窗口、冻结阅读窗口、selector 引用和 delta 合并回归测试。
+- [x] 构建并发布 `versionName=0.3.5`、`versionCode=9` APK；Gitea Release `v0.3.5`，SHA-256 见发布记录。
 - [ ] Redmi K80 安装 v0.3.5 后复验：持续流式输出、向上阅读、展开工具组、回到底部均无明显卡顿或跳闪。
