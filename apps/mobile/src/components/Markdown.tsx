@@ -1,4 +1,4 @@
-import { Fragment, type ReactNode } from 'react';
+import { Fragment, memo, type ReactNode } from 'react';
 
 interface InlineOptions {
   keyPrefix: string;
@@ -43,7 +43,7 @@ function listItemText(line: string): { ordered: boolean; text: string } {
   return { ordered, text: line.replace(/^\s*(?:[-*+]\s+|\d+[.)]\s+)/, '') };
 }
 
-export function Markdown({ content }: { content: string }) {
+export const Markdown = memo(function Markdown({ content }: { content: string }) {
   const lines = content.replace(/\r\n?/g, '\n').split('\n');
   const blocks: ReactNode[] = [];
   let cursor = 0;
@@ -137,4 +137,4 @@ export function Markdown({ content }: { content: string }) {
   }
 
   return <div className="markdown-content">{blocks}</div>;
-}
+});

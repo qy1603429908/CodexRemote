@@ -10,6 +10,7 @@ import { MessageBubble } from './MessageBubble';
 import { GitDiffPanel } from './GitDiffPanel';
 import { PromptQueuePanel } from './PromptQueuePanel';
 import { TransientActivity } from './TransientActivity';
+import { ElapsedTime } from './ElapsedTime';
 
 interface ConversationScreenProps {
   thread: RemoteThread;
@@ -88,7 +89,8 @@ export function subagentsFromMessages(messages: RemoteMessage[]): Array<{ id: st
     const receiverIds = detail?.receiverThreadIds ?? record(detail?.item)?.receiverThreadIds;
     if (Array.isArray(receiverIds)) for (const value of receiverIds) {
       const id = String(value);
-      mergeAgent({ id, label: id.slice(0, 8), state: message.status === 'streaming' ? 'active' : 'complete' });
+      if (!agents.has(id))
+        mergeAgent({ id, label: id.slice(0, 8), state: message.status === 'streaming' ? 'active' : 'unknown' });
     }
   }
   // Compact mobile caches intentionally drop bulky raw event details. Recover the
@@ -130,40 +132,41 @@ export function agentStatePresentation(state: string): { className: string; labe
 
 const BOTTOM_FOLLOW_DISTANCE = 96;
 
-function formatElapsed(ms: number): string {
-  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
-  const hours = Math.floor(totalSeconds / 3600);
-  const minutes = Math.floor((totalSeconds % 3600) / 60);
-  const seconds = totalSeconds % 60;
-  return hours > 0
-    ? `${hours}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
-    : `${minutes}:${String(seconds).padStart(2, '0')}`;
-}
 
 function nearBottom(element: HTMLElement): boolean {
   return element.scrollHeight - element.scrollTop - element.clientHeight <= BOTTOM_FOLLOW_DISTANCE;
 }
 
+type AgentTarget = { id: string; label: string; state: string };
+
 export type ConversationEntry =
-  | { type: 'message'; message: RemoteMessage }
-  | { type: 'tool-group'; id: string; messages: RemoteMessage[] };
+  | { type: 'message'; message: RemoteMessage; agentTargets: AgentTarget[] }
+  | { type: 'tool-group'; id: string; messages: RemoteMessage[]; agentTargets: AgentTarget[]; agentTargetsByMessage: Record<string, AgentTarget[]> };
 
 export function groupConsecutiveToolMessages(messages: RemoteMessage[]): ConversationEntry[] {
   const entries: ConversationEntry[] = [];
   let pending: RemoteMessage[] = [];
+  const messageEntry = (message: RemoteMessage): ConversationEntry => ({
+    type: 'message',
+    message,
+    agentTargets: subagentsFromMessages([message]),
+  });
   const flush = () => {
-    if (pending.length === 1) entries.push({ type: 'message', message: pending[0]! });
-    else if (pending.length > 1) entries.push({ type: 'tool-group', id: `tools:${pending[0]!.id}`, messages: pending });
+    if (pending.length === 1) entries.push(messageEntry(pending[0]!));
+    else if (pending.length > 1) entries.push({
+      type: 'tool-group',
+      id: `tools:${pending[0]!.id}`,
+      messages: pending,
+      agentTargets: subagentsFromMessages(pending),
+      agentTargetsByMessage: Object.fromEntries(pending.map((message) => [message.id, subagentsFromMessages([message])])),
+    });
     pending = [];
   };
   for (const message of messages) {
-    const type = message.itemType?.toLowerCase() ?? '';
-    const name = message.toolName?.toLowerCase() ?? '';
-    const isAgentTool = type.includes('collabagent') || type.includes('subagent') || name.includes('subagent');
-    if (message.role === 'tool' && !isAgentTool) pending.push(message);
+    if (message.role === 'tool') pending.push(message);
     else {
       flush();
-      entries.push({ type: 'message', message });
+      entries.push(messageEntry(message));
     }
   }
   flush();
@@ -203,10 +206,10 @@ export function ConversationScreen({ thread, messages, subagents: threadSubagent
   const previousContentKeyRef = useRef('');
   const historyAnchorRef = useRef<{ height: number; top: number } | null>(null);
   const suppressNextContentNotificationRef = useRef(false);
+  const followScrollFrameRef = useRef<number | null>(null);
   const [hasNewContent, setHasNewContent] = useState(false);
   const [agentsExpanded, setAgentsExpanded] = useState(false);
   const [expandedToolGroupIds, setExpandedToolGroupIds] = useState<Set<string>>(() => new Set());
-  const [now, setNow] = useState(Date.now());
 
   const visibleMessages = useMemo(() => messages.filter((message) => !isContextMessage(message)), [messages]);
   const reasoning = useMemo(() => latestReasoning(messages, currentTurnId), [currentTurnId, messages]);
@@ -250,14 +253,32 @@ export function ConversationScreen({ thread, messages, subagents: threadSubagent
     setHasNewContent(false);
     setAgentsExpanded(false);
     setExpandedToolGroupIds(new Set());
+    if (followScrollFrameRef.current != null) {
+      window.cancelAnimationFrame(followScrollFrameRef.current);
+      followScrollFrameRef.current = null;
+    }
   }, [thread.id]);
 
   const scrollToBottom = () => {
     const stream = streamRef.current;
     if (!stream) return;
+    if (followScrollFrameRef.current != null) {
+      window.cancelAnimationFrame(followScrollFrameRef.current);
+      followScrollFrameRef.current = null;
+    }
     stream.scrollTop = stream.scrollHeight;
     followingRef.current = true;
     setHasNewContent(false);
+  };
+
+  const scheduleFollowScroll = () => {
+    if (followScrollFrameRef.current != null) return;
+    followScrollFrameRef.current = window.requestAnimationFrame(() => {
+      followScrollFrameRef.current = null;
+      const stream = streamRef.current;
+      if (!stream || !followingRef.current) return;
+      stream.scrollTop = stream.scrollHeight;
+    });
   };
 
   useLayoutEffect(() => {
@@ -283,7 +304,7 @@ export function ConversationScreen({ thread, messages, subagents: threadSubagent
     if (!contentChanged || suppressNotification) return;
 
     if (followingRef.current) {
-      stream.scrollTop = stream.scrollHeight;
+      scheduleFollowScroll();
       setHasNewContent(false);
     } else {
       setHasNewContent(true);
@@ -296,25 +317,23 @@ export function ConversationScreen({ thread, messages, subagents: threadSubagent
     if (!content || !stream || typeof ResizeObserver === 'undefined') return;
 
     const observer = new ResizeObserver(() => {
-      if (followingRef.current) stream.scrollTop = stream.scrollHeight;
+      if (followingRef.current) scheduleFollowScroll();
     });
     observer.observe(content);
-    return () => observer.disconnect();
+    return () => {
+      observer.disconnect();
+      if (followScrollFrameRef.current != null) {
+        window.cancelAnimationFrame(followScrollFrameRef.current);
+        followScrollFrameRef.current = null;
+      }
+    };
   }, []);
-
-  useEffect(() => {
-    if (!running) return;
-    setNow(Date.now());
-    const timer = window.setInterval(() => setNow(Date.now()), 1000);
-    return () => window.clearInterval(timer);
-  }, [running]);
 
   const activeModel = useMemo(
     () => models.find((model) => model.model === selectedModel || model.id === selectedModel),
     [models, selectedModel],
   );
   const effortOptions = activeModel?.supportedReasoningEfforts ?? [];
-  const elapsed = running && thread.currentTurnStartedAt ? formatElapsed(now - thread.currentTurnStartedAt) : '';
 
   return (
     <main className="app-screen conversation-screen">
@@ -354,7 +373,7 @@ export function ConversationScreen({ thread, messages, subagents: threadSubagent
         </label>
         <div className={`run-indicator ${running ? 'is-running' : ''}`}>
           <span />
-          <strong>{running ? `执行中${elapsed ? ` · ${elapsed}` : ''}` : thread.state === 'waiting_approval' ? '等待授权' : thread.state === 'waiting_input' ? '等待输入' : thread.state === 'error' ? '异常' : thread.state === 'idle' ? '可继续' : thread.state === 'not_loaded' ? '未载入' : '等待同步'}</strong>
+          <strong>{running ? <>执行中{thread.currentTurnStartedAt && <> · <ElapsedTime startedAt={thread.currentTurnStartedAt} /></>}</> : thread.state === 'waiting_approval' ? '等待授权' : thread.state === 'waiting_input' ? '等待输入' : thread.state === 'error' ? '异常' : thread.state === 'idle' ? '可继续' : thread.state === 'not_loaded' ? '未载入' : '等待同步'}</strong>
         </div>
       </section>
 
@@ -418,7 +437,7 @@ export function ConversationScreen({ thread, messages, subagents: threadSubagent
               </div>
             )}
             {conversationEntries.map((entry) => entry.type === 'message' ? (
-              <MessageBubble key={entry.message.id} message={entry.message} agentTargets={subagentsFromMessages([entry.message])} onOpenAgent={onOpenThread} onLoadAttachment={onLoadAttachment} onDownloadAttachment={onDownloadAttachment} />
+              <MessageBubble key={entry.message.id} message={entry.message} agentTargets={entry.agentTargets} onOpenAgent={onOpenThread} onLoadAttachment={onLoadAttachment} onDownloadAttachment={onDownloadAttachment} />
             ) : (
               <details
                 className={`tool-call-group${entry.messages.some((message) => message.status === 'streaming') ? ' is-streaming' : ''}`}
@@ -440,11 +459,43 @@ export function ConversationScreen({ thread, messages, subagents: threadSubagent
                   <span className="tool-group-disclosure" aria-hidden="true">›</span>
                   <strong>工具调用 · {entry.messages.length}</strong>
                   <small>{entry.messages.map((message) => message.toolName || '工具').slice(0, 3).join('、')}{entry.messages.length > 3 ? '…' : ''}</small>
-                  <span className="tool-group-action">展开</span>
+                  <span className="tool-group-summary-actions">
+                    {entry.agentTargets.slice(0, 2).map((agent) => (
+                      <button
+                        className="tool-group-summary-agent"
+                        key={agent.id}
+                        type="button"
+                        title={`打开 ${agent.label}`}
+                        onClick={(event) => {
+                          event.preventDefault();
+                          event.stopPropagation();
+                          onOpenThread(agent.id);
+                        }}
+                      >
+                        <span aria-hidden="true" />
+                        {agent.label}
+                      </button>
+                    ))}
+                    {entry.agentTargets.length > 2 && <span className="tool-group-agent-more">+{entry.agentTargets.length - 2}</span>}
+                    <span className="tool-group-action">展开</span>
+                  </span>
                 </summary>
-                <div className="tool-call-group-items">
-                  {entry.messages.map((message) => <MessageBubble key={message.id} message={message} agentTargets={subagentsFromMessages([message])} onOpenAgent={onOpenThread} onLoadAttachment={onLoadAttachment} onDownloadAttachment={onDownloadAttachment} />)}
-                </div>
+                {entry.agentTargets.length > 0 && (
+                  <nav className="message-agent-links tool-group-agent-links" aria-label="此工具组关联的 Subagent">
+                    {entry.agentTargets.map((agent) => (
+                      <button key={agent.id} type="button" onClick={() => onOpenThread(agent.id)}>
+                        <span aria-hidden="true" />
+                        <strong>{agent.label}</strong>
+                        <small>打开</small>
+                      </button>
+                    ))}
+                  </nav>
+                )}
+                {expandedToolGroupIds.has(entry.id) && (
+                  <div className="tool-call-group-items">
+                    {entry.messages.map((message) => <MessageBubble key={message.id} message={message} agentTargets={entry.agentTargetsByMessage[message.id] ?? []} onOpenAgent={onOpenThread} onLoadAttachment={onLoadAttachment} onDownloadAttachment={onDownloadAttachment} />)}
+                  </div>
+                )}
               </details>
             ))}
             {approvals.map((approval) => <ApprovalCard key={approval.id} approval={approval} onResolve={onResolveApproval} />)}
@@ -458,7 +509,7 @@ export function ConversationScreen({ thread, messages, subagents: threadSubagent
         )}
       </div>
 
-      <TransientActivity running={running} content={reasoning?.content} elapsed={elapsed} />
+      <TransientActivity running={running} content={reasoning?.content} startedAt={thread.currentTurnStartedAt} />
       <CompactionStatusBar status={compaction} onDismiss={onDismissCompaction} />
       <ConversationContextPanel key={thread.id} thread={thread} messages={messages} />
       <GitDiffPanel snapshot={gitDiff} onRefresh={onRefreshGitDiff} />

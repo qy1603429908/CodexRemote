@@ -37,27 +37,42 @@ export function cacheScope(serverUrl: string, token: string): string {
   return (hash >>> 0).toString(36);
 }
 
+export function messagesForThread(threadId: string, messages: RemoteMessage[]): RemoteMessage[] {
+  return messages.filter((message) => message.threadId === threadId);
+}
+
+export function sanitizeMessagesByThread(messagesByThread: Record<string, RemoteMessage[]>): Record<string, RemoteMessage[]> {
+  return Object.fromEntries(
+    Object.entries(messagesByThread).map(([threadId, messages]) => [threadId, messagesForThread(threadId, messages)]),
+  );
+}
+
+export function sanitizeRemoteCache(snapshot: RemoteCacheSnapshot): RemoteCacheSnapshot {
+  return { ...snapshot, messagesByThread: sanitizeMessagesByThread(snapshot.messagesByThread) };
+}
+
 export function compactCache(snapshot: RemoteCacheSnapshot): RemoteCacheSnapshot {
-  const newestThreadIds = snapshot.threads
+  const sanitized = sanitizeRemoteCache(snapshot);
+  const newestThreadIds = sanitized.threads
     .slice()
     .sort((a, b) => b.updatedAt - a.updatedAt)
     .slice(0, MAX_THREADS_WITH_MESSAGES)
     .map((thread) => thread.id);
-  if (snapshot.selectedThreadId && !newestThreadIds.includes(snapshot.selectedThreadId)) {
-    newestThreadIds.unshift(snapshot.selectedThreadId);
+  if (sanitized.selectedThreadId && !newestThreadIds.includes(sanitized.selectedThreadId)) {
+    newestThreadIds.unshift(sanitized.selectedThreadId);
   }
   const allowed = new Set(newestThreadIds);
   const messagesByThread: Record<string, RemoteMessage[]> = {};
-  for (const [threadId, messages] of Object.entries(snapshot.messagesByThread)) {
+  for (const [threadId, messages] of Object.entries(sanitized.messagesByThread)) {
     if (!allowed.has(threadId)) continue;
     messagesByThread[threadId] = messages
       .slice(-MAX_MESSAGES_PER_THREAD)
       .map(({ detail: _detail, ...message }) => message);
   }
   const historyByThread = Object.fromEntries(
-    Object.entries(snapshot.historyByThread).filter(([threadId]) => allowed.has(threadId)),
+    Object.entries(sanitized.historyByThread).filter(([threadId]) => allowed.has(threadId)),
   );
-  return { ...snapshot, messagesByThread, historyByThread };
+  return { ...sanitized, messagesByThread, historyByThread };
 }
 
 export async function loadRemoteCache(scope: string): Promise<RemoteCacheSnapshot | null> {
@@ -69,7 +84,7 @@ export async function loadRemoteCache(scope: string): Promise<RemoteCacheSnapsho
         request.onsuccess = () => resolve(request.result);
         request.onerror = () => reject(request.error);
       });
-      return validSnapshot(value) ? value : null;
+      return validSnapshot(value) ? sanitizeRemoteCache(value) : null;
     }
   } catch {
     // Fall back to localStorage below.
@@ -77,7 +92,7 @@ export async function loadRemoteCache(scope: string): Promise<RemoteCacheSnapsho
   try {
     const raw = globalThis.localStorage?.getItem(`${FALLBACK_PREFIX}${scope}`);
     const value: unknown = raw ? JSON.parse(raw) : null;
-    return validSnapshot(value) ? value : null;
+    return validSnapshot(value) ? sanitizeRemoteCache(value) : null;
   } catch {
     return null;
   }

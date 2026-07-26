@@ -188,6 +188,10 @@ describe('native foreground-service event listener', () => {
     process.cwd(),
     'android/app/src/main/java/dev/codexmobile/remote/CodexBackgroundService.java',
   ), 'utf8');
+  const pluginSource = readFileSync(resolve(
+    process.cwd(),
+    'android/app/src/main/java/dev/codexmobile/remote/CodexBackgroundPlugin.java',
+  ), 'utf8');
   const bridgeSource = readFileSync(resolve(process.cwd(), 'src/lib/background.ts'), 'utf8');
   const appSource = readFileSync(resolve(process.cwd(), 'src/App.tsx'), 'utf8');
 
@@ -206,6 +210,17 @@ describe('native foreground-service event listener', () => {
     expect(socketSource).not.toContain('synchronized void restart(');
     expect(bridgeSource).toContain('serverUrl: config.serverUrl');
     expect(appSource).toMatch(/config === null[\s\S]*CodexBackground\.stop/);
+  });
+
+  it('restarts the background runtime after permission recovery without letting update create an empty service', () => {
+    expect(bridgeSource).toContain('resumeBackgroundRuntime');
+    expect(bridgeSource).toContain('CodexBackground.getStatus()');
+    expect(bridgeSource).toMatch(/if \(!status\.running\) return false;[\s\S]*CodexBackground\.update/);
+    expect(appSource).toContain("addListener('appStateChange'");
+    expect(appSource).toContain('resumeBackgroundRuntime(config');
+    expect(appSource).toContain('Android 后台通知服务未启动');
+    expect(pluginSource).toMatch(/public void update\(PluginCall call\)[\s\S]*isMarkedRunning\(getContext\(\)\)[\s\S]*running", false/);
+    expect(socketSource).toMatch(/token == null \|\| token\.isEmpty\(\)[\s\S]*scheduleReconnect\(\)/);
   });
 
   it('observes completion, approval and waiting-state events using the same notification IDs as the WebView', () => {

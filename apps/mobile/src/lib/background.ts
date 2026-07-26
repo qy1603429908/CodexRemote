@@ -41,16 +41,30 @@ export async function startBackgroundRuntime(config: RemoteConfig, threadId?: st
   }
 }
 
-export async function updateBackgroundThread(threadId?: string, title?: string): Promise<void> {
-  if (!Capacitor.isNativePlatform()) return;
+export async function resumeBackgroundRuntime(config: RemoteConfig, threadId?: string): Promise<boolean> {
+  if (!Capacitor.isNativePlatform()) return false;
   try {
-    await CodexBackground.update({
+    const status = await CodexBackground.getStatus();
+    if (status.running) return true;
+  } catch {
+    // Fall through to a full permission check and start attempt.
+  }
+  return startBackgroundRuntime(config, threadId);
+}
+
+export async function updateBackgroundThread(threadId?: string, title?: string): Promise<boolean> {
+  if (!Capacitor.isNativePlatform()) return false;
+  try {
+    const status = await CodexBackground.getStatus();
+    if (!status.running) return false;
+    const result = await CodexBackground.update({
       title: 'Codex Mobile Remote',
       text: title ? `后台同步 · ${title}` : '后台连接与审批提醒已启用',
       threadId,
       action: threadId ? 'openThread' : 'openBackground',
     });
+    return result.running;
   } catch {
-    // The service may not have been started because notification permission was denied.
+    return false;
   }
 }

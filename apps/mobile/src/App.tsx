@@ -9,7 +9,7 @@ import { ThreadList } from './components/ThreadList';
 import { useRemote } from './hooks/useRemote';
 import { clearRemoteConfig, loadRemoteConfig, type RemoteConfig } from './lib/configStore';
 import { initializeNotifications } from './lib/notifications';
-import { CodexBackground, startBackgroundRuntime, updateBackgroundThread } from './lib/background';
+import { CodexBackground, resumeBackgroundRuntime, startBackgroundRuntime, updateBackgroundThread } from './lib/background';
 
 export function popThreadBackStack(stack: string[]): { previousThreadId: string | null; remaining: string[] } {
   if (stack.length === 0) return { previousThreadId: null, remaining: [] };
@@ -20,6 +20,7 @@ export function App() {
   const [config, setConfig] = useState<RemoteConfig | null | undefined>(undefined);
   const [showSettings, setShowSettings] = useState(false);
   const [showNewThread, setShowNewThread] = useState(false);
+  const [backgroundError, setBackgroundError] = useState('');
   const [selectedAgentByThread, setSelectedAgentByThread] = useState<Record<string, string | null>>({});
   const threadBackStackRef = useRef<string[]>([]);
   const remote = useRemote(config ?? null);
@@ -66,8 +67,22 @@ export function App() {
       void CodexBackground.stop();
       return;
     }
-    void startBackgroundRuntime(config, remote.selectedThreadId ?? undefined);
+    void startBackgroundRuntime(config, remote.selectedThreadId ?? undefined).then((running) => {
+      setBackgroundError(running ? '' : 'Android 后台通知服务未启动；请检查通知权限后重新回到 App。');
+    });
   }, [config]);
+
+  useEffect(() => {
+    if (!config || !Capacitor.isNativePlatform()) return;
+    let listener: { remove: () => Promise<void> } | null = null;
+    void CapacitorApp.addListener('appStateChange', ({ isActive }) => {
+      if (!isActive) return;
+      void resumeBackgroundRuntime(config, remote.selectedThreadId ?? undefined).then((running) => {
+        setBackgroundError(running ? '' : 'Android 后台通知服务仍未启动；请确认通知权限和系统后台运行限制。');
+      });
+    }).then((handle) => { listener = handle; });
+    return () => void listener?.remove();
+  }, [config, remote.selectedThreadId]);
 
   useEffect(() => {
     if (!config || !Capacitor.isNativePlatform()) return;
@@ -208,10 +223,10 @@ export function App() {
         <NewThreadSheet models={remote.models} defaultModel={remote.selectedModel} onClose={() => setShowNewThread(false)} onStart={remote.startThread} />
       )}
 
-      {remote.lastError && (
+      {(remote.lastError || backgroundError) && (
         <div className="error-toast" role="alert">
-          <span>{remote.lastError}</span>
-          <button type="button" onClick={remote.dismissError} aria-label="关闭错误提示">×</button>
+          <span>{remote.lastError || backgroundError}</span>
+          <button type="button" onClick={() => { remote.dismissError(); setBackgroundError(''); }} aria-label="关闭错误提示">×</button>
         </div>
       )}
     </>

@@ -1,10 +1,63 @@
 import { describe, expect, it } from "vitest";
-import { cacheScope, clearRemoteCache, compactCache, type RemoteCacheSnapshot } from "../src/lib/remoteCache";
+import { cacheScope, clearRemoteCache, compactCache, loadRemoteCache, messagesForThread, type RemoteCacheSnapshot } from "../src/lib/remoteCache";
 
 describe("remote cache", () => {
   it("uses endpoint and token as an isolated stable scope", () => {
     expect(cacheScope("HTTPS://HOST/", "token")).toBe(cacheScope("https://host", "token"));
     expect(cacheScope("https://host", "token-a")).not.toBe(cacheScope("https://host", "token-b"));
+  });
+
+  it("filters messages by the target thread id", () => {
+    const owned = { id: "owned", threadId: "child", role: "assistant" as const, content: "child", createdAt: 1, status: "complete" as const };
+    const foreign = { ...owned, id: "foreign", threadId: "parent" };
+    expect(messagesForThread("child", [foreign, owned])).toEqual([owned]);
+  });
+
+  it("removes foreign messages from every bucket during compaction", () => {
+    const child = { id: "child-message", threadId: "child", role: "assistant" as const, content: "child", createdAt: 1, status: "complete" as const };
+    const parent = { ...child, id: "parent-message", threadId: "parent" };
+    const snapshot: RemoteCacheSnapshot = {
+      schema: 4, savedAt: 1, syncCursor: 2, threadIndexVersion: 3, selectedThreadId: "child",
+      threads: [
+        { id: "child", title: "Child", preview: "", cwd: "/tmp", modelProvider: "custom", updatedAt: 2, state: "idle", unread: 0 },
+        { id: "parent", title: "Parent", preview: "", cwd: "/tmp", modelProvider: "custom", updatedAt: 1, state: "idle", unread: 0 },
+      ],
+      messagesByThread: { child: [parent, child], parent: [child, parent] },
+      historyByThread: {},
+    };
+    expect(compactCache(snapshot).messagesByThread).toEqual({ child: [child], parent: [parent] });
+  });
+
+  it("sanitizes a polluted fallback cache while loading", async () => {
+    const child = { id: "child-message", threadId: "child", role: "assistant" as const, content: "child", createdAt: 1, status: "complete" as const };
+    const parent = { ...child, id: "parent-message", threadId: "parent" };
+    const snapshot: RemoteCacheSnapshot = {
+      schema: 4, savedAt: 1, syncCursor: 2, threadIndexVersion: 3, selectedThreadId: "child",
+      threads: [{ id: "child", title: "Child", preview: "", cwd: "/tmp", modelProvider: "custom", updatedAt: 1, state: "idle", unread: 0 }],
+      messagesByThread: { child: [child, parent] },
+      historyByThread: {},
+    };
+    const values = new Map([["codex-mobile.remote-cache.v4.polluted", JSON.stringify(snapshot)]]);
+    const storage = {
+      get length() { return values.size; },
+      key(index: number) { return [...values.keys()][index] ?? null; },
+      getItem(key: string) { return values.get(key) ?? null; },
+      setItem(key: string, value: string) { values.set(key, value); },
+      removeItem(key: string) { values.delete(key); },
+      clear() { values.clear(); },
+    };
+    const originalStorage = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
+    const originalIndexedDb = Object.getOwnPropertyDescriptor(globalThis, "indexedDB");
+    Object.defineProperty(globalThis, "localStorage", { configurable: true, value: storage });
+    Object.defineProperty(globalThis, "indexedDB", { configurable: true, value: undefined });
+    try {
+      expect((await loadRemoteCache("polluted"))?.messagesByThread).toEqual({ child: [child] });
+    } finally {
+      if (originalStorage) Object.defineProperty(globalThis, "localStorage", originalStorage);
+      else delete (globalThis as { localStorage?: unknown }).localStorage;
+      if (originalIndexedDb) Object.defineProperty(globalThis, "indexedDB", originalIndexedDb);
+      else delete (globalThis as { indexedDB?: unknown }).indexedDB;
+    }
   });
 
   it("bounds persisted histories and removes volatile detail payloads", () => {
