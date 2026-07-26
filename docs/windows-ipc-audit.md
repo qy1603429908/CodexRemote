@@ -118,3 +118,25 @@ Desktop IPC 是私有版本化协议。Codex Desktop 升级后必须复测：
 - start/steer/interrupt/settings/history/approval 的 wire shape。
 
 发现未知版本时 Server 会记录 diagnostic 并拒绝把该广播当作已支持状态，避免静默误解析。
+
+## 6. 2026-07-26 合并前加固与最终验证
+
+PR 合并前额外修复了两类已确认的 P2：
+
+- `normalizeDesktopConversation()` 现在始终只保留一层 `{ desktopIpc, original }`，连续 100 次 patch/normalize 不再形成 `source.original.original...`。
+- `thread-stream-state-changed` snapshot 只有在本 bridge 已进入该 conversation 的 follow 流程时才接受；带 `targetClientIds` 的广播必须包含当前 clientId；owner 建立后其他 source 即使 revision 更高也不能替换，只有旧 owner 明确 `following=false` 后才允许新 owner 接管。
+
+最终合并树验证：
+
+```text
+Protocol build: 通过
+Server typecheck: 通过
+Server tests: 71 passed, 2 skipped
+Server build: 通过
+Mobile typecheck: 通过
+Mobile tests: 116 passed
+Mobile production build: 通过
+git diff --check: 通过
+```
+
+Windows IPC 支持随后以保留历史的 merge commit 合并到 `main`；Android v0.3.4 的 tag 和 APK 发布提交保持不变。

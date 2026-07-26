@@ -171,7 +171,7 @@
 | 53 | 长会话上下滑动、工具组展开/折叠明显卡顿并伴随跳闪 | 已完成（自动化，待真机） | 移除整页/整列表每秒重渲染；计时局部更新；Markdown memo；原始事件按需 stringify；关闭工具组不挂载消息；滚动跟随每帧最多一次且阅读上文时不抢位置。 |
 | 54 | Redmi K80 状态栏/挖孔和底部导航安全区回归 | 已完成（静态/构建，待真机） | 顶部标题栏、主页、详情页、弹层与底部输入区统一使用系统 CSS inset；三键与手势导航均不遮挡内容。 |
 | 55 | 完成、审批、等待输入等人工介入事件无通知或无提示音 | 已完成（自动化，待真机） | Android 13+ 权限、通知渠道、内置声音、前台 Service 和后台 WebSocket 链路完整；前台未聚焦、后台、锁屏均能提示，解决后取消占位通知且不重复响铃。 |
-| 56 | Android 回归、APK 与 Windows IPC 合并顺序 | Android 已发布，Windows 待合并 | 先完成上述 Android 自动化测试、版本升级和新版 APK/Gitea Release；随后才将 Windows IPC PR 的 source 幂等与 owner/target 校验修复合并到主分支。 |
+| 56 | Android 回归、APK 与 Windows IPC 合并顺序 | 已完成 | 先完成上述 Android 自动化测试、版本升级和新版 APK/Gitea Release；随后才将 Windows IPC PR 的 source 幂等与 owner/target 校验修复合并到主分支。 |
 
 - [x] 完成 `thread.open` 迟到响应、A→B 切换和有效 `thread.start` 的导航回归测试。
 - [x] 完成父/子 turn、item owner、污染缓存和无 threadId 实时事件的隔离回归测试。
@@ -179,4 +179,4 @@
 - [x] 完成主页多层 Subagent 下拉窄屏布局和无横向 overflow 回归测试。
 - [ ] 完成通知前台/后台/锁屏及 Redmi K80 三键/手势导航真机验收；无法在当前环境证明的部分必须明确标为未证明。
 - [x] 构建、校验并发布 v0.3.4 APK；记录 SHA-256、versionCode、versionName、测试命令和结果。
-- [ ] Android 发布后合并 Windows IPC 分支，并重新执行 Protocol、Server、Mobile 全量测试和 build。
+- [x] Android 发布后合并 Windows IPC 分支，并重新执行 Protocol、Server、Mobile 全量测试和 build。
