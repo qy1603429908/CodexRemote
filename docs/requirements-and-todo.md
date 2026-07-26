@@ -233,4 +233,4 @@
 - [x] 修复前台 WebView 与后台 Socket 对同一审批各发一次声音：按稳定 notificationId 原子认领，不用扩大时间窗误伤相邻的不同审批。
 - [x] 构建并安装 v0.3.7（versionCode 11）到 Redmi Note 14 Pro+；新 Computer Use 审批真机日志仅出现 1 次 approval fallback，前台迟到 notifyApproval 被 notificationId 认领拦截。
 - [x] 记录 APK SHA-256：`807591cf75e5a1c30ee6fb807c4ea659fbe3496f2413642506e9a1d590333fb9`。
-- [ ] 完成真机单次铃声复验、Git 审查和发布。
+- [x] 完成真机单次铃声复验、Git 审查和 Gitea v0.3.7 Release 发布。
