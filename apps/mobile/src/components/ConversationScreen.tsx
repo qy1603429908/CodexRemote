@@ -54,68 +54,82 @@ interface ConversationScreenProps {
 }
 
 
+type AgentTarget = { id: string; label: string; state: string };
+
 type UnknownRecord = Record<string, unknown>;
 function record(value: unknown): UnknownRecord | null {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as UnknownRecord : null;
 }
 
-export function subagentsFromMessages(messages: RemoteMessage[]): Array<{ id: string; label: string; state: string }> {
-  const agents = new Map<string, { id: string; label: string; state: string }>();
-  const terminalRank = (state: string) => {
-    const normalized = state.toLowerCase();
-    if (/fail|failed|error|errored|cancel|interrupt|shutdown|notfound/.test(normalized)) return 3;
-    if (/complete|completed|idle/.test(normalized)) return 2;
-    return 1;
-  };
-  const mergeAgent = (next: { id: string; label: string; state: string }) => {
-    const current = agents.get(next.id);
-    if (current && terminalRank(current.state) >= terminalRank(next.state)) {
-      agents.set(next.id, { ...current, label: current.label !== next.id.slice(0, 8) ? current.label : next.label });
-      return;
-    }
-    agents.set(next.id, { ...next, label: current?.label && current.label !== next.id.slice(0, 8) ? current.label : next.label });
-  };
-  for (const message of messages) {
-    const type = message.itemType?.toLowerCase() ?? '';
-    if (!type.includes('collabagent') && !type.includes('subagent')) continue;
-    const detail = record(message.detail);
-    const states = record(detail?.agentsStates) ?? record(record(detail?.item)?.agentsStates);
-    if (states) {
-      for (const [id, value] of Object.entries(states)) {
-        const agent = record(value);
-        mergeAgent({ id, label: String(agent?.nickname ?? agent?.name ?? id.slice(0, 8)), state: String(agent?.status ?? 'active') });
-      }
-    }
-    const receiverIds = detail?.receiverThreadIds ?? record(detail?.item)?.receiverThreadIds;
-    if (Array.isArray(receiverIds)) for (const value of receiverIds) {
-      const id = String(value);
-      if (!agents.has(id))
-        mergeAgent({ id, label: id.slice(0, 8), state: message.status === 'streaming' ? 'active' : 'unknown' });
+const EMPTY_AGENT_TARGETS: AgentTarget[] = [];
+const agentTargetsByMessage = new WeakMap<RemoteMessage, AgentTarget[]>();
+
+function terminalRank(state: string): number {
+  const normalized = state.toLowerCase();
+  if (/fail|failed|error|errored|cancel|interrupt|shutdown|notfound/.test(normalized)) return 3;
+  if (/complete|completed|idle/.test(normalized)) return 2;
+  return 1;
+}
+
+function mergeAgentTarget(agents: Map<string, AgentTarget>, next: AgentTarget): void {
+  const current = agents.get(next.id);
+  if (current && terminalRank(current.state) >= terminalRank(next.state)) {
+    agents.set(next.id, { ...current, label: current.label !== next.id.slice(0, 8) ? current.label : next.label });
+    return;
+  }
+  agents.set(next.id, { ...next, label: current?.label && current.label !== next.id.slice(0, 8) ? current.label : next.label });
+}
+
+export function subagentsFromMessage(message: RemoteMessage): AgentTarget[] {
+  const cached = agentTargetsByMessage.get(message);
+  if (cached) return cached;
+  const type = message.itemType?.toLowerCase() ?? '';
+  const name = message.toolName?.toLowerCase() ?? '';
+  if (!type.includes('collabagent') && !type.includes('subagent') && !name.includes('subagent')) {
+    agentTargetsByMessage.set(message, EMPTY_AGENT_TARGETS);
+    return EMPTY_AGENT_TARGETS;
+  }
+
+  const agents = new Map<string, AgentTarget>();
+  const detail = record(message.detail);
+  const states = record(detail?.agentsStates) ?? record(record(detail?.item)?.agentsStates);
+  if (states) {
+    for (const [id, value] of Object.entries(states)) {
+      const agent = record(value);
+      mergeAgentTarget(agents, { id, label: String(agent?.nickname ?? agent?.name ?? id.slice(0, 8)), state: String(agent?.status ?? 'active') });
     }
   }
-  // Compact mobile caches intentionally drop bulky raw event details. Recover the
-  // stable thread IDs from the rendered collaboration text so Subagent chips survive an
-  // app restart and a Desktop snapshot replacing the original tool payload.
-  for (const message of messages) {
-    const type = message.itemType?.toLowerCase() ?? '';
-    const name = message.toolName?.toLowerCase() ?? '';
-    if (!type.includes('collabagent') && !type.includes('subagent') && !name.includes('subagent')) continue;
-    const lines = message.content.split('\n');
-    const ids = new Set<string>();
-    for (const line of lines) {
-      const trimmed = line.trim();
-      const isActivity = type.includes('subagentactivity') || name === 'subagent 活动';
-      const isBareActivityId = isActivity && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(trimmed);
-      if (!trimmed.startsWith('Agent:') && !/^[0-9a-f]{8}-[0-9a-f-]{27}:\s/i.test(trimmed) && !isBareActivityId) continue;
-      for (const match of trimmed.matchAll(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi)) ids.add(match[0]!);
-    }
-    for (const id of ids) {
-      const stateLine = lines.find((line) => line.trimStart().startsWith(`${id}:`));
-      const state = stateLine?.slice(stateLine.indexOf(':') + 1).split('—')[0]?.trim();
-      mergeAgent({ id, label: id.slice(0, 8), state: state || (message.status === 'streaming' ? 'active' : 'unknown') });
-    }
+  const receiverIds = detail?.receiverThreadIds ?? record(detail?.item)?.receiverThreadIds;
+  if (Array.isArray(receiverIds)) for (const value of receiverIds) {
+    const id = String(value);
+    if (!agents.has(id)) mergeAgentTarget(agents, { id, label: id.slice(0, 8), state: message.status === 'streaming' ? 'active' : 'unknown' });
   }
-  return [...agents.values()];
+
+  // Compact mobile caches intentionally drop bulky raw event details. Recover stable
+  // thread IDs from collaboration text after a restart or Desktop snapshot replace.
+  const lines = message.content.split('\n');
+  const ids = new Set<string>();
+  for (const line of lines) {
+    const trimmed = line.trim();
+    const isActivity = type.includes('subagentactivity') || name === 'subagent 活动';
+    const isBareActivityId = isActivity && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(trimmed);
+    if (!trimmed.startsWith('Agent:') && !/^[0-9a-f]{8}-[0-9a-f-]{27}:\s/i.test(trimmed) && !isBareActivityId) continue;
+    for (const match of trimmed.matchAll(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi)) ids.add(match[0]!);
+  }
+  for (const id of ids) {
+    const stateLine = lines.find((line) => line.trimStart().startsWith(`${id}:`));
+    const state = stateLine?.slice(stateLine.indexOf(':') + 1).split('—')[0]?.trim();
+    mergeAgentTarget(agents, { id, label: id.slice(0, 8), state: state || (message.status === 'streaming' ? 'active' : 'unknown') });
+  }
+  const result = agents.size > 0 ? [...agents.values()] : EMPTY_AGENT_TARGETS;
+  agentTargetsByMessage.set(message, result);
+  return result;
+}
+
+export function subagentsFromMessages(messages: RemoteMessage[]): AgentTarget[] {
+  const agents = new Map<string, AgentTarget>();
+  for (const message of messages) for (const agent of subagentsFromMessage(message)) mergeAgentTarget(agents, agent);
+  return agents.size > 0 ? [...agents.values()] : EMPTY_AGENT_TARGETS;
 }
 
 export function agentStatePresentation(state: string): { className: string; label: string } {
@@ -137,8 +151,6 @@ function nearBottom(element: HTMLElement): boolean {
   return element.scrollHeight - element.scrollTop - element.clientHeight <= BOTTOM_FOLLOW_DISTANCE;
 }
 
-type AgentTarget = { id: string; label: string; state: string };
-
 export type ConversationEntry =
   | { type: 'message'; message: RemoteMessage; agentTargets: AgentTarget[] }
   | { type: 'tool-group'; id: string; messages: RemoteMessage[]; agentTargets: AgentTarget[]; agentTargetsByMessage: Record<string, AgentTarget[]> };
@@ -147,30 +159,70 @@ export function groupConsecutiveToolMessages(messages: RemoteMessage[]): Convers
   const entries: ConversationEntry[] = [];
   let pending: RemoteMessage[] = [];
   const messageEntry = (message: RemoteMessage): ConversationEntry => ({
-    type: 'message',
-    message,
-    agentTargets: subagentsFromMessages([message]),
+    type: 'message', message, agentTargets: subagentsFromMessage(message),
   });
   const flush = () => {
     if (pending.length === 1) entries.push(messageEntry(pending[0]!));
-    else if (pending.length > 1) entries.push({
-      type: 'tool-group',
-      id: `tools:${pending[0]!.id}`,
-      messages: pending,
-      agentTargets: subagentsFromMessages(pending),
-      agentTargetsByMessage: Object.fromEntries(pending.map((message) => [message.id, subagentsFromMessages([message])])),
-    });
+    else if (pending.length > 1) {
+      const targetsByMessage: Record<string, AgentTarget[]> = {};
+      const targets = new Map<string, AgentTarget>();
+      for (const message of pending) {
+        const messageTargets = subagentsFromMessage(message);
+        targetsByMessage[message.id] = messageTargets;
+        for (const target of messageTargets) mergeAgentTarget(targets, target);
+      }
+      entries.push({
+        type: 'tool-group', id: `tools:${pending[0]!.id}`, messages: pending,
+        agentTargets: targets.size > 0 ? [...targets.values()] : EMPTY_AGENT_TARGETS,
+        agentTargetsByMessage: targetsByMessage,
+      });
+    }
     pending = [];
   };
   for (const message of messages) {
     if (message.role === 'tool') pending.push(message);
-    else {
-      flush();
-      entries.push(messageEntry(message));
-    }
+    else { flush(); entries.push(messageEntry(message)); }
   }
   flush();
   return entries;
+}
+
+export function subagentsFromConversationEntries(entries: ConversationEntry[]): AgentTarget[] {
+  const agents = new Map<string, AgentTarget>();
+  for (const entry of entries) for (const agent of entry.agentTargets) mergeAgentTarget(agents, agent);
+  return agents.size > 0 ? [...agents.values()] : EMPTY_AGENT_TARGETS;
+}
+
+export const DEFAULT_RENDERED_ENTRY_LIMIT = 80;
+export const RENDERED_ENTRY_CHUNK = 80;
+
+export function conversationEntryWindow(entries: ConversationEntry[], limit: number, end = entries.length): {
+  entries: ConversationEntry[];
+  hiddenCount: number;
+  hiddenAfter: number;
+  start: number;
+  end: number;
+} {
+  const safeLimit = Math.max(1, Math.floor(limit));
+  const safeEnd = Math.max(0, Math.min(entries.length, Math.floor(end)));
+  const start = Math.max(0, safeEnd - safeLimit);
+  return {
+    entries: start === 0 && safeEnd === entries.length ? entries : entries.slice(start, safeEnd),
+    hiddenCount: start,
+    hiddenAfter: entries.length - safeEnd,
+    start,
+    end: safeEnd,
+  };
+}
+
+const messageRevisionIds = new WeakMap<RemoteMessage, number>();
+let nextMessageRevisionId = 1;
+function messageRevisionId(message: RemoteMessage): number {
+  const cached = messageRevisionIds.get(message);
+  if (cached) return cached;
+  const revision = nextMessageRevisionId++;
+  messageRevisionIds.set(message, revision);
+  return revision;
 }
 
 export function visibleConversationContentKey(
@@ -181,20 +233,14 @@ export function visibleConversationContentKey(
   const entryKey = entries.map((entry) => {
     if (entry.type === 'message') {
       const { message } = entry;
-      return `message:${message.id}:${message.status}:${message.content.length}`;
+      return `message:${message.id}:${messageRevisionId(message)}:${message.status}:${message.content.length}`;
     }
-    if (!expandedToolGroupIds.has(entry.id)) {
-      // A closed group is one visible summary row. Internal streaming/output updates must
-      // not pretend that a new visible timeline row appeared while the user reads above.
-      return `tool-group:${entry.id}:closed`;
-    }
-    return `tool-group:${entry.id}:open:${entry.messages
-      .map((message) => `${message.id}:${message.status}:${message.content.length}`)
-      .join('|')}`;
+    if (!expandedToolGroupIds.has(entry.id)) return `tool-group:${entry.id}:closed`;
+    return `tool-group:${entry.id}:open:${entry.messages.map((message) => (
+      `${message.id}:${messageRevisionId(message)}:${message.status}:${message.content.length}`
+    )).join('|')}`;
   }).join('|');
-  const approvalKey = approvals
-    .map((approval) => `${approval.id}:${approval.description?.length ?? 0}:${approval.command?.length ?? 0}`)
-    .join('|');
+  const approvalKey = approvals.map((approval) => `${approval.id}:${approval.description?.length ?? 0}:${approval.command?.length ?? 0}`).join('|');
   return `${entryKey}::${approvalKey}`;
 }
 
@@ -207,13 +253,30 @@ export function ConversationScreen({ thread, messages, subagents: threadSubagent
   const historyAnchorRef = useRef<{ height: number; top: number } | null>(null);
   const suppressNextContentNotificationRef = useRef(false);
   const followScrollFrameRef = useRef<number | null>(null);
+  const previousEntryCountRef = useRef(0);
   const [hasNewContent, setHasNewContent] = useState(false);
   const [agentsExpanded, setAgentsExpanded] = useState(false);
+  const [renderedEntryLimit, setRenderedEntryLimit] = useState(DEFAULT_RENDERED_ENTRY_LIMIT);
+  const [frozenEntryEnd, setFrozenEntryEnd] = useState<number | null>(null);
   const [expandedToolGroupIds, setExpandedToolGroupIds] = useState<Set<string>>(() => new Set());
 
   const visibleMessages = useMemo(() => messages.filter((message) => !isContextMessage(message)), [messages]);
   const reasoning = useMemo(() => latestReasoning(messages, currentTurnId), [currentTurnId, messages]);
   const conversationEntries = useMemo(() => groupConsecutiveToolMessages(visibleMessages), [visibleMessages]);
+  const historyEntryGrowth = historyAnchorRef.current
+    ? Math.max(0, conversationEntries.length - previousEntryCountRef.current)
+    : 0;
+  const effectiveRenderedEntryLimit = renderedEntryLimit + historyEntryGrowth;
+  const effectiveFrozenEntryEnd = frozenEntryEnd == null ? null : frozenEntryEnd + historyEntryGrowth;
+  const renderedWindow = useMemo(
+    () => conversationEntryWindow(
+      conversationEntries,
+      effectiveRenderedEntryLimit,
+      effectiveFrozenEntryEnd ?? conversationEntries.length,
+    ),
+    [conversationEntries, effectiveFrozenEntryEnd, effectiveRenderedEntryLimit],
+  );
+  const parsedSubagents = useMemo(() => subagentsFromConversationEntries(conversationEntries), [conversationEntries]);
   const subagents = useMemo(() => {
     const combined = new Map<string, { id: string; label: string; state: string; thread?: RemoteThread }>();
     for (const agent of threadSubagents) {
@@ -224,7 +287,7 @@ export function ConversationScreen({ thread, messages, subagents: threadSubagent
         thread: agent,
       });
     }
-    for (const activity of subagentsFromMessages(messages)) {
+    for (const activity of parsedSubagents) {
       const existing = combined.get(activity.id);
       const activityTerminal = /complete|completed|fail|failed|error|errored|cancel|interrupt|shutdown|notfound/.test(activity.state.toLowerCase());
       const existingNeedsEvidence = existing?.state === 'not_loaded' || existing?.state === 'unknown';
@@ -236,15 +299,25 @@ export function ConversationScreen({ thread, messages, subagents: threadSubagent
       });
     }
     return [...combined.values()];
-  }, [messages, threadSubagents]);
+  }, [parsedSubagents, threadSubagents]);
   const displayedSubagents = agentsExpanded ? subagents : subagents.slice(0, 6);
   const hiddenSubagentCount = Math.max(0, subagents.length - displayedSubagents.length);
   const selectedAgent = subagents.find((agent) => agent.id === selectedAgentId) ?? null;
 
   const contentKey = useMemo(
-    () => visibleConversationContentKey(conversationEntries, expandedToolGroupIds, approvals),
-    [approvals, conversationEntries, expandedToolGroupIds],
+    () => visibleConversationContentKey(renderedWindow.entries, expandedToolGroupIds, approvals),
+    [approvals, expandedToolGroupIds, renderedWindow.entries],
   );
+
+  useLayoutEffect(() => {
+    previousEntryCountRef.current = conversationEntries.length;
+    if (effectiveRenderedEntryLimit !== renderedEntryLimit) setRenderedEntryLimit(effectiveRenderedEntryLimit);
+    if (effectiveFrozenEntryEnd !== frozenEntryEnd) setFrozenEntryEnd(effectiveFrozenEntryEnd);
+  }, [conversationEntries.length, effectiveFrozenEntryEnd, effectiveRenderedEntryLimit, frozenEntryEnd, renderedEntryLimit]);
+
+  useEffect(() => {
+    if (renderedWindow.hiddenAfter > 0) setHasNewContent(true);
+  }, [renderedWindow.hiddenAfter]);
 
   useLayoutEffect(() => {
     initializedRef.current = false;
@@ -252,6 +325,9 @@ export function ConversationScreen({ thread, messages, subagents: threadSubagent
     followingRef.current = true;
     setHasNewContent(false);
     setAgentsExpanded(false);
+    setRenderedEntryLimit(DEFAULT_RENDERED_ENTRY_LIMIT);
+    setFrozenEntryEnd(null);
+    previousEntryCountRef.current = 0;
     setExpandedToolGroupIds(new Set());
     if (followScrollFrameRef.current != null) {
       window.cancelAnimationFrame(followScrollFrameRef.current);
@@ -266,6 +342,8 @@ export function ConversationScreen({ thread, messages, subagents: threadSubagent
       window.cancelAnimationFrame(followScrollFrameRef.current);
       followScrollFrameRef.current = null;
     }
+    if (renderedEntryLimit !== DEFAULT_RENDERED_ENTRY_LIMIT) setRenderedEntryLimit(DEFAULT_RENDERED_ENTRY_LIMIT);
+    if (frozenEntryEnd != null) setFrozenEntryEnd(null);
     stream.scrollTop = stream.scrollHeight;
     followingRef.current = true;
     setHasNewContent(false);
@@ -290,7 +368,7 @@ export function ConversationScreen({ thread, messages, subagents: threadSubagent
     const suppressNotification = suppressNextContentNotificationRef.current;
     suppressNextContentNotificationRef.current = false;
     const historyAnchor = historyAnchorRef.current;
-    if (historyAnchor && contentChanged) {
+    if (historyAnchor && !historyLoading) {
       stream.scrollTop = historyAnchor.top + (stream.scrollHeight - historyAnchor.height);
       historyAnchorRef.current = null;
       return;
@@ -309,7 +387,7 @@ export function ConversationScreen({ thread, messages, subagents: threadSubagent
     } else {
       setHasNewContent(true);
     }
-  }, [contentKey]);
+  }, [contentKey, historyLoading, renderedWindow.start]);
 
   useEffect(() => {
     const content = contentRef.current;
@@ -407,14 +485,36 @@ export function ConversationScreen({ thread, messages, subagents: threadSubagent
         <section
           ref={streamRef}
           className="message-stream"
-          aria-live="polite"
+          aria-live="off"
           onScroll={(event) => {
+            const wasFollowing = followingRef.current;
             const follows = nearBottom(event.currentTarget);
             followingRef.current = follows;
-            if (follows) setHasNewContent(false);
+            if (!follows && wasFollowing) setFrozenEntryEnd(conversationEntries.length);
+            if (follows) {
+              setHasNewContent(false);
+              if (!wasFollowing && (frozenEntryEnd != null || renderedEntryLimit > DEFAULT_RENDERED_ENTRY_LIMIT)) {
+                setFrozenEntryEnd(null);
+                setRenderedEntryLimit(DEFAULT_RENDERED_ENTRY_LIMIT);
+                scheduleFollowScroll();
+              }
+            }
           }}
         >
           <div ref={contentRef} className="message-stream-content">
+            {renderedWindow.hiddenCount > 0 && (
+              <button
+                className="history-load-button"
+                type="button"
+                onClick={() => {
+                  const stream = streamRef.current;
+                  if (stream) historyAnchorRef.current = { height: stream.scrollHeight, top: stream.scrollTop };
+                  setRenderedEntryLimit((current) => current + RENDERED_ENTRY_CHUNK);
+                }}
+              >
+                显示更早的已载入记录（{Math.min(RENDERED_ENTRY_CHUNK, renderedWindow.hiddenCount)} 条）
+              </button>
+            )}
             {(historyHasMore || historyLoading) && (
               <button
                 className="history-load-button"
@@ -436,7 +536,7 @@ export function ConversationScreen({ thread, messages, subagents: threadSubagent
                 <p>输入指令，Codex 将在电脑上的当前任务中执行。输入 / 可查看手机命令。</p>
               </div>
             )}
-            {conversationEntries.map((entry) => entry.type === 'message' ? (
+            {renderedWindow.entries.map((entry) => entry.type === 'message' ? (
               <MessageBubble key={entry.message.id} message={entry.message} agentTargets={entry.agentTargets} onOpenAgent={onOpenThread} onLoadAttachment={onLoadAttachment} onDownloadAttachment={onDownloadAttachment} />
             ) : (
               <details

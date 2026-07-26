@@ -1,10 +1,155 @@
 import { describe, expect, it } from 'vitest';
-import { canonicalProjectedItems, compactionStatusFromThreadPayload, consumeThreadActivationIntent, contextCompactionItemIdsFromThreadPayload, dedupeMessages, eventThreadId, normalizeThreadPayload, optimisticAttachmentsFromUploads, reconcileMessages, reconcileThreadSnapshot, stateFromStatus, turnIdsAfterSnapshot, visibleUserText } from '../src/hooks/useRemote';
+import { applyPendingMessageDeltas, canonicalProjectedItems, compactionStatusFromThreadPayload, consumeThreadActivationIntent, contextCompactionItemIdsFromThreadPayload, createSelectedMessagesSelector, dedupeMessages, eventThreadId, normalizeThreadPayload, optimisticAttachmentsFromUploads, reconcileMessages, reconcileThreadSnapshot, stateFromStatus, turnIdsAfterSnapshot, visibleUserText } from '../src/hooks/useRemote';
 import type { RemoteMessage } from '../src/types/protocol';
 
 function user(id: string, content: string, createdAt: number): RemoteMessage {
   return { id, threadId: 'thread', role: 'user', content, createdAt, status: 'complete' };
 }
+
+
+describe('Buffered streaming deltas', () => {
+  it('coalesces ordered deltas for the same item in one immutable thread update', () => {
+    const stable = user('stable', 'keep', 1);
+    const current = { thread: [stable] };
+    const next = applyPendingMessageDeltas(current, [
+      { threadId: 'thread', turnId: 'turn', itemId: 'stream', delta: 'hello', role: 'assistant', createdAt: 2 },
+      { threadId: 'thread', turnId: 'turn', itemId: 'stream', delta: ' world', role: 'assistant', createdAt: 2 },
+    ]);
+    expect(next).not.toBe(current);
+    expect(next.thread).toEqual([
+      stable,
+      expect.objectContaining({ id: 'stream', content: 'hello world', status: 'streaming' }),
+    ]);
+    expect(next.thread?.[0]).toBe(stable);
+  });
+
+  it('never downgrades a terminal message when a late delta arrives', () => {
+    const completed: RemoteMessage = {
+      id: 'done', threadId: 'thread', turnId: 'turn', role: 'assistant',
+      content: 'canonical', createdAt: 1, completedAt: 2, status: 'complete',
+    };
+    const next = applyPendingMessageDeltas({ thread: [completed] }, [
+      { threadId: 'thread', turnId: 'turn', itemId: 'done', delta: ' late', role: 'assistant', createdAt: 3 },
+    ]);
+    expect(next.thread).toEqual([completed]);
+    expect(next.thread?.[0]).toBe(completed);
+  });
+
+  it('updates multiple streaming items using one indexed pass per thread', () => {
+    const current = {
+      thread: [
+        { ...user('assistant', 'A', 1), role: 'assistant' as const, status: 'streaming' as const },
+        { ...user('tool', 'B', 2), role: 'tool' as const, status: 'streaming' as const },
+      ],
+    };
+    const next = applyPendingMessageDeltas(current, [
+      { threadId: 'thread', itemId: 'assistant', delta: '1', role: 'assistant', createdAt: 3 },
+      { threadId: 'thread', itemId: 'tool', delta: '2', role: 'tool', createdAt: 3 },
+    ]);
+    expect(next.thread?.map((message) => message.content)).toEqual(['A1', 'B2']);
+  });
+});
+
+describe('Selected message reference stability', () => {
+  it('keeps the selected array reference when only another thread bucket changes', () => {
+    const select = createSelectedMessagesSelector();
+    const selected = user('selected', 'selected content', 1);
+    const firstTodoByThread: Record<string, RemoteMessage> = {};
+    const firstBuckets = { thread: [selected], other: [{ ...user('other-1', 'old', 1), threadId: 'other' }] };
+    const first = select('thread', firstBuckets, firstTodoByThread);
+    const second = select('thread', {
+      ...firstBuckets,
+      other: [{ ...user('other-2', 'new', 2), threadId: 'other' }],
+    }, firstTodoByThread);
+    const third = select('thread', firstBuckets, {
+      other: { ...user('other-todo', '- [ ] unrelated', 3), threadId: 'other', itemType: 'todo-list' },
+    });
+
+    expect(second).toBe(first);
+    expect(third).toBe(first);
+    expect(third[0]).toBe(first[0]);
+  });
+
+  it('keeps the selected array and item references for an equal cloned bucket', () => {
+    const select = createSelectedMessagesSelector();
+    const original = { ...user('selected', 'same content', 1), detail: { source: 'desktop' } };
+    const first = select('thread', { thread: [original] }, {});
+    const second = select('thread', { thread: [{ ...original, detail: { source: 'desktop' } }] }, {});
+
+    expect(second).toBe(first);
+    expect(second[0]).toBe(first[0]);
+  });
+
+  it('returns a new array only for changed content and reuses unchanged message objects', () => {
+    const select = createSelectedMessagesSelector();
+    const firstMessage = user('first', 'stable', 1);
+    const changingMessage = user('changing', 'before', 2);
+    const first = select('thread', { thread: [firstMessage, changingMessage] }, {});
+    const second = select('thread', {
+      thread: [{ ...firstMessage }, { ...changingMessage, content: 'after' }],
+    }, {});
+
+    expect(second).not.toBe(first);
+    expect(second[0]).toBe(first[0]);
+    expect(second[1]).not.toBe(first[1]);
+    expect(second[1]?.content).toBe('after');
+  });
+
+  it('keeps an equal cloned selected TODO stable and replaces it when TODO content changes', () => {
+    const select = createSelectedMessagesSelector();
+    const message = user('message', 'body', 1);
+    const todo: RemoteMessage = {
+      ...user('todo', '- [ ] pending', 2), itemType: 'todo-list', toolName: '计划', detail: { revision: 1 },
+    };
+    const first = select('thread', { thread: [message] }, { thread: todo });
+    const equal = select('thread', { thread: [{ ...message }] }, {
+      thread: { ...todo, detail: { revision: 1 } },
+    });
+    const changed = select('thread', { thread: [{ ...message }] }, {
+      thread: { ...todo, content: '- [x] complete', detail: { revision: 2 } },
+    });
+
+    expect(equal).toBe(first);
+    expect(changed).not.toBe(first);
+    expect(changed[0]).toBe(first[0]);
+    expect(changed[1]).not.toBe(first[1]);
+  });
+
+  it('stabilizes a large equal snapshot and only replaces the changed message', () => {
+    const select = createSelectedMessagesSelector();
+    const messages = Array.from({ length: 500 }, (_, index) => user(`message-${index}`, `content-${index}`, index));
+    const first = select('thread', { thread: messages }, {});
+    const equal = select('thread', { thread: messages.map((message) => ({ ...message })) }, {});
+    const changed = select('thread', {
+      thread: messages.map((message, index) => index === 250 ? { ...message, content: 'changed' } : { ...message }),
+    }, {});
+
+    expect(equal).toBe(first);
+    expect(changed).not.toBe(first);
+    expect(changed.filter((message, index) => message === first[index])).toHaveLength(499);
+  });
+
+  it('injects the current TODO, deduplicates it by id, and ignores foreign-thread messages', () => {
+    const select = createSelectedMessagesSelector();
+    const oldTodo: RemoteMessage = {
+      ...user('todo', '- [ ] old', 2), itemType: 'todo-list', toolName: '计划',
+    };
+    const currentTodo: RemoteMessage = {
+      ...oldTodo, content: '- [x] current', detail: { plan: [{ step: 'current', status: 'completed' }] },
+    };
+    const foreign = { ...user('foreign', 'must not leak', 3), threadId: 'other' };
+
+    const selected = select(
+      'thread',
+      { thread: [user('message', 'body', 1), oldTodo, foreign] },
+      { thread: currentTodo },
+    );
+
+    expect(selected.map((message) => message.id)).toEqual(['message', 'todo']);
+    expect(selected[1]).toMatchObject({ threadId: 'thread', content: '- [x] current' });
+    expect(selected.some((message) => message.threadId !== 'thread')).toBe(false);
+  });
+});
 
 describe('Desktop/mobile reconciliation', () => {
   it('does not reactivate a task when a delayed open response arrives after returning to the list', () => {

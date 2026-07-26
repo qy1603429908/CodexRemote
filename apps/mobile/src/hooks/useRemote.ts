@@ -481,7 +481,10 @@ function messageCorrelationIds(message: RemoteMessage): string[] {
 
 export function dedupeMessages(messages: RemoteMessage[]): RemoteMessage[] {
   const byId = new Map<string, RemoteMessage>();
-  for (const message of messages) byId.set(message.id, { ...byId.get(message.id), ...message });
+  for (const message of messages) {
+    const previous = byId.get(message.id);
+    byId.set(message.id, previous ? { ...previous, ...message } : message);
+  }
   const output: RemoteMessage[] = [];
   const correlationIndex = new Map<string, number>();
   for (const message of byId.values()) {
@@ -497,6 +500,153 @@ export function dedupeMessages(messages: RemoteMessage[]): RemoteMessage[] {
     messageCorrelationIds(output[existingIndex]!).forEach((key) => correlationIndex.set(key, existingIndex));
   }
   return output;
+}
+
+const EMPTY_SELECTED_MESSAGES: RemoteMessage[] = [];
+
+function sameJsonLikeValue(left: unknown, right: unknown): boolean {
+  if (Object.is(left, right)) return true;
+  if (left == null || right == null || typeof left !== 'object' || typeof right !== 'object') return false;
+  if (Array.isArray(left) || Array.isArray(right)) {
+    if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) return false;
+    return left.every((value, index) => sameJsonLikeValue(value, right[index]));
+  }
+  const leftRecord = left as Record<string, unknown>;
+  const rightRecord = right as Record<string, unknown>;
+  const leftKeys = Object.keys(leftRecord);
+  const rightKeys = Object.keys(rightRecord);
+  if (leftKeys.length !== rightKeys.length) return false;
+  return leftKeys.every((key) => Object.prototype.hasOwnProperty.call(rightRecord, key)
+    && sameJsonLikeValue(leftRecord[key], rightRecord[key]));
+}
+
+function sameRemoteMessage(left: RemoteMessage, right: RemoteMessage): boolean {
+  return left.id === right.id
+    && left.threadId === right.threadId
+    && left.turnId === right.turnId
+    && left.role === right.role
+    && left.content === right.content
+    && left.createdAt === right.createdAt
+    && left.completedAt === right.completedAt
+    && left.durationMs === right.durationMs
+    && left.status === right.status
+    && left.toolName === right.toolName
+    && left.itemType === right.itemType
+    && left.collapsible === right.collapsible
+    && sameJsonLikeValue(left.attachments, right.attachments)
+    && sameJsonLikeValue(left.detail, right.detail);
+}
+
+export type SelectedMessagesSelector = (
+  selectedThreadId: string | null,
+  messagesByThread: Record<string, RemoteMessage[]>,
+  todoByThread: Record<string, RemoteMessage>,
+) => RemoteMessage[];
+
+export function createSelectedMessagesSelector(): SelectedMessagesSelector {
+  let previousThreadId: string | null | undefined;
+  let previousSource: RemoteMessage[] | undefined;
+  let previousTodo: RemoteMessage | undefined;
+  let previousResult = EMPTY_SELECTED_MESSAGES;
+
+  return (selectedThreadId, messagesByThread, todoByThread) => {
+    const source = selectedThreadId ? messagesByThread[selectedThreadId] : undefined;
+    const todo = selectedThreadId ? todoByThread[selectedThreadId] : undefined;
+    if (selectedThreadId === previousThreadId && source === previousSource && todo === previousTodo) {
+      return previousResult;
+    }
+
+    const oldThreadId = previousThreadId;
+    const oldResult = previousResult;
+    previousThreadId = selectedThreadId;
+    previousSource = source;
+    previousTodo = todo;
+
+    if (!selectedThreadId) {
+      previousResult = EMPTY_SELECTED_MESSAGES;
+      return previousResult;
+    }
+
+    const sourceWithTodo = todo ? [...(source ?? EMPTY_SELECTED_MESSAGES), todo] : (source ?? EMPTY_SELECTED_MESSAGES);
+    const projected = dedupeMessages(messagesForThread(selectedThreadId, sourceWithTodo));
+    if (projected.length === 0) {
+      previousResult = oldThreadId === selectedThreadId && oldResult.length === 0 ? oldResult : EMPTY_SELECTED_MESSAGES;
+      return previousResult;
+    }
+
+    const previousById = oldThreadId === selectedThreadId
+      ? new Map(oldResult.map((message) => [message.id, message]))
+      : new Map<string, RemoteMessage>();
+    const stabilized = projected.map((message) => {
+      const previous = previousById.get(message.id);
+      return previous && sameRemoteMessage(previous, message) ? previous : message;
+    });
+    const resultUnchanged = oldThreadId === selectedThreadId
+      && stabilized.length === oldResult.length
+      && stabilized.every((message, index) => message === oldResult[index]);
+    previousResult = resultUnchanged ? oldResult : stabilized;
+    return previousResult;
+  };
+}
+
+
+export interface PendingMessageDelta {
+  threadId: string;
+  turnId?: string;
+  itemId: string;
+  delta: string;
+  role: RemoteMessage['role'];
+  toolName?: string;
+  itemType?: string;
+  createdAt: number;
+}
+
+export function applyPendingMessageDeltas(
+  current: Record<string, RemoteMessage[]>,
+  pending: PendingMessageDelta[],
+): Record<string, RemoteMessage[]> {
+  if (pending.length === 0) return current;
+  const byThread = new Map<string, PendingMessageDelta[]>();
+  for (const delta of pending) {
+    const bucket = byThread.get(delta.threadId);
+    if (bucket) bucket.push(delta);
+    else byThread.set(delta.threadId, [delta]);
+  }
+  const next = { ...current };
+  for (const [threadId, deltas] of byThread) {
+    const items = [...messagesForThread(threadId, current[threadId] ?? [])];
+    const indexById = new Map(items.map((item, index) => [item.id, index]));
+    for (const delta of deltas) {
+      const index = indexById.get(delta.itemId);
+      if (index != null) {
+        const previous = items[index]!;
+        if (previous.status !== 'streaming') continue;
+        items[index] = {
+          ...previous,
+          turnId: previous.turnId ?? delta.turnId,
+          content: previous.content + delta.delta,
+          status: 'streaming',
+          ...(delta.toolName ? { toolName: delta.toolName } : {}),
+          ...(delta.itemType ? { itemType: delta.itemType } : {}),
+        };
+      } else {
+        indexById.set(delta.itemId, items.length);
+        items.push({
+          id: delta.itemId,
+          threadId,
+          turnId: delta.turnId,
+          role: delta.role,
+          content: delta.delta,
+          createdAt: delta.createdAt,
+          status: 'streaming',
+          toolName: delta.toolName,
+          itemType: delta.itemType,
+        });
+      }
+    }
+    next[threadId] = items;
+  }
+  return next;
 }
 
 function latestPlanMessage(messages: RemoteMessage[]): RemoteMessage | undefined {
@@ -891,6 +1041,10 @@ export function useRemote(config: RemoteConfig | null) {
   const [historyLoadingByThread, setHistoryLoadingByThread] = useState<Record<string, boolean>>({});
   const historyByThreadRef = useRef<Record<string, CachedHistoryState>>({});
   const messagesByThreadRef = useRef<Record<string, RemoteMessage[]>>({});
+  const pendingMessageDeltasRef = useRef<Map<string, PendingMessageDelta>>(new Map());
+  const pendingMessageDeltaTimerRef = useRef<number | null>(null);
+  const terminalMessageItemsRef = useRef<Set<string>>(new Set());
+  const terminalMessageTurnsRef = useRef<Set<string>>(new Set());
   const syncVersionRef = useRef<string | undefined>(undefined);
   const syncCursorRef = useRef(0);
   const threadIndexVersionRef = useRef(0);
@@ -921,6 +1075,14 @@ export function useRemote(config: RemoteConfig | null) {
   useEffect(() => {
     messagesByThreadRef.current = messagesByThread;
   }, [messagesByThread]);
+
+  useEffect(() => () => {
+    if (pendingMessageDeltaTimerRef.current != null) window.clearTimeout(pendingMessageDeltaTimerRef.current);
+    pendingMessageDeltaTimerRef.current = null;
+    pendingMessageDeltasRef.current.clear();
+    terminalMessageItemsRef.current.clear();
+    terminalMessageTurnsRef.current.clear();
+  }, []);
 
   useEffect(() => {
     historyByThreadRef.current = historyByThread;
@@ -1118,31 +1280,37 @@ export function useRemote(config: RemoteConfig | null) {
     for (const thread of nextThreads) updateAttentionNotification(thread.id, thread.state);
   }, [clearThreadAttentionNotification, updateAttentionNotification]);
 
+  const flushPendingMessageDeltas = useCallback(() => {
+    if (pendingMessageDeltaTimerRef.current != null) {
+      window.clearTimeout(pendingMessageDeltaTimerRef.current);
+      pendingMessageDeltaTimerRef.current = null;
+    }
+    if (pendingMessageDeltasRef.current.size === 0) return;
+    const pending = [...pendingMessageDeltasRef.current.values()];
+    pendingMessageDeltasRef.current.clear();
+    setMessagesByThread((current) => applyPendingMessageDeltas(current, pending));
+  }, []);
+
   const appendDelta = useCallback(
     (threadId: string, turnId: string | undefined, itemId: string, delta: string, role: RemoteMessage['role'], toolName?: string, itemType?: string) => {
       if (!delta) return;
-      setMessagesByThread((current) => {
-        const items = [...messagesForThread(threadId, current[threadId] ?? [])];
-        const index = items.findIndex((item) => item.id === itemId);
-        if (index >= 0) {
-          items[index] = { ...items[index], turnId: items[index].turnId ?? turnId, content: items[index].content + delta, status: 'streaming', ...(toolName ? { toolName } : {}), ...(itemType ? { itemType } : {}) };
-        } else {
-          items.push({
-            id: itemId,
-            threadId,
-            turnId,
-            role,
-            content: delta,
-            createdAt: Date.now(),
-            status: 'streaming',
-            toolName,
-            itemType,
-          });
-        }
-        return { ...current, [threadId]: items };
-      });
+      const itemKey = `${threadId}\u0000${itemId}`;
+      const turnKey = turnId ? `${threadId}\u0000${turnId}` : '';
+      if (terminalMessageItemsRef.current.has(itemKey) || (turnKey && terminalMessageTurnsRef.current.has(turnKey))) return;
+      const key = itemKey;
+      const previous = pendingMessageDeltasRef.current.get(key);
+      pendingMessageDeltasRef.current.set(key, previous ? {
+        ...previous,
+        turnId: previous.turnId ?? turnId,
+        delta: previous.delta + delta,
+        ...(toolName ? { toolName } : {}),
+        ...(itemType ? { itemType } : {}),
+      } : { threadId, turnId, itemId, delta, role, toolName, itemType, createdAt: Date.now() });
+      if (pendingMessageDeltaTimerRef.current == null) {
+        pendingMessageDeltaTimerRef.current = window.setTimeout(flushPendingMessageDeltas, 32);
+      }
     },
-    [],
+    [flushPendingMessageDeltas],
   );
 
   const handleEvent = useCallback(
@@ -1152,6 +1320,15 @@ export function useRemote(config: RemoteConfig | null) {
       const turnId = eventTurnId(params);
       const item = record(params?.item);
       const itemId = stringValue(params?.itemId, item?.id) ?? `${turnId ?? 'turn'}_${method}`;
+      const lowerMethod = method.toLowerCase();
+      const isBufferedTextDelta = method === 'item/reasoning/summaryTextDelta'
+        || method === 'item/reasoning/textDelta'
+        || method === 'item/plan/delta'
+        || method === 'item/mcpToolCall/progress'
+        || method === 'turn/diff/updated'
+        || (lowerMethod.includes('agentmessage') && lowerMethod.includes('delta'))
+        || lowerMethod.includes('outputdelta');
+      if (!isBufferedTextDelta) flushPendingMessageDeltas();
 
       if ((method === 'thread/started' || method === 'desktop/threadSnapshot') && params?.thread) {
         const normalized = normalizeThreadPayload({ thread: params.thread });
@@ -1200,6 +1377,7 @@ export function useRemote(config: RemoteConfig | null) {
         return;
       }
       if (method === 'turn/started' && threadId && turnId) {
+        terminalMessageTurnsRef.current.delete(`${threadId}\u0000${turnId}`);
         setTurnIds((current) => ({ ...current, [threadId]: turnId }));
         const turn = record(params?.turn);
         const startedAt = timestamp(turn?.startedAt ?? turn?.turnStartedAtMs ?? turn?.startedAtMs ?? params?.startedAtMs ?? Date.now());
@@ -1217,6 +1395,7 @@ export function useRemote(config: RemoteConfig | null) {
         return;
       }
       if (method === 'turn/completed' && threadId) {
+        if (turnId) terminalMessageTurnsRef.current.add(`${threadId}\u0000${turnId}`);
         const turn = record(params?.turn);
         const failed = String(turn?.status ?? '').toLowerCase() === 'failed';
         const error = record(turn?.error);
@@ -1383,6 +1562,14 @@ export function useRemote(config: RemoteConfig | null) {
         return;
       }
       if ((method === 'item/started' || method === 'item/completed') && threadId && item) {
+        const terminalItemKey = `${threadId}\u0000${itemId}`;
+        if (method === 'item/started') {
+          terminalMessageItemsRef.current.delete(terminalItemKey);
+          terminalMessageItemsRef.current.delete(`${terminalItemKey}_detail`);
+        } else {
+          terminalMessageItemsRef.current.add(terminalItemKey);
+          terminalMessageItemsRef.current.add(`${terminalItemKey}_detail`);
+        }
         if (isContextCompactionItem(item)) {
           if (turnId) {
             compactionTurnIdsRef.current[threadId] ??= new Set();
@@ -1441,7 +1628,7 @@ export function useRemote(config: RemoteConfig | null) {
         appendDelta(threadId, turnId, itemId, textFromContent(params?.delta), 'tool', '命令输出');
       }
     },
-    [appendDelta, clearThreadAttentionNotification, observeCompactionSnapshot, replaceThreadsAndSyncAttention, reportCompactionFailure, updateAttentionNotification, updateCompactionStatus, updateThreadState],
+    [appendDelta, clearThreadAttentionNotification, flushPendingMessageDeltas, observeCompactionSnapshot, replaceThreadsAndSyncAttention, reportCompactionFailure, updateAttentionNotification, updateCompactionStatus, updateThreadState],
   );
 
   const handleMessage = useCallback(
@@ -2290,23 +2477,19 @@ export function useRemote(config: RemoteConfig | null) {
     () => threads.find((thread) => thread.id === selectedThreadId) ?? null,
     [selectedThreadId, threads],
   );
-  const selectedMessages = useMemo(
-    () => selectedThreadId
-      ? dedupeMessages(messagesForThread(
-          selectedThreadId,
-          [...(messagesByThread[selectedThreadId] ?? []), ...(todoByThread[selectedThreadId] ? [todoByThread[selectedThreadId]] : [])],
-        ))
-      : [],
-    [messagesByThread, selectedThreadId, todoByThread],
-  );
+  const selectedMessagesSelectorRef = useRef<SelectedMessagesSelector | null>(null);
+  if (!selectedMessagesSelectorRef.current) selectedMessagesSelectorRef.current = createSelectedMessagesSelector();
+  const selectedMessages = selectedMessagesSelectorRef.current(selectedThreadId, messagesByThread, todoByThread);
   const selectedCompaction = selectedThreadId ? (compactionsByThread[selectedThreadId] ?? null) : null;
   const selectedPromptQueue = selectedThreadId ? (promptQueueByThread[selectedThreadId] ?? []) : [];
   const selectedGitDiff = selectedThreadId ? (gitDiffByThread[selectedThreadId] ?? null) : null;
-  const selectedSubagents = selectedThreadId
-    ? threads.filter((thread) => thread.parentThreadId === selectedThreadId)
-    : [];
-  const selectedApprovals = approvals.filter(
-    (approval) => !approval.threadId || approval.threadId === selectedThreadId,
+  const selectedSubagents = useMemo(
+    () => selectedThreadId ? threads.filter((thread) => thread.parentThreadId === selectedThreadId) : [],
+    [selectedThreadId, threads],
+  );
+  const selectedApprovals = useMemo(
+    () => approvals.filter((approval) => !approval.threadId || approval.threadId === selectedThreadId),
+    [approvals, selectedThreadId],
   );
   const running = selectedThread?.state === 'running';
   const canInterrupt = Boolean(selectedThreadId && turnIds[selectedThreadId]);

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { agentStatePresentation, groupConsecutiveToolMessages, subagentsFromMessages, visibleConversationContentKey } from '../src/components/ConversationScreen';
+import { agentStatePresentation, conversationEntryWindow, DEFAULT_RENDERED_ENTRY_LIMIT, groupConsecutiveToolMessages, subagentsFromMessages, visibleConversationContentKey } from '../src/components/ConversationScreen';
 import { latestReasoning } from '../src/components/ConversationContextPanel';
 import type { RemoteMessage } from '../src/types/protocol';
 
@@ -160,5 +160,74 @@ describe('Transient reasoning selection', () => {
       reasoning('summary', 'current-turn', '正在修复同步'),
       reasoning('detail', 'current-turn', '内部详情', '思考详情'),
     ], 'current-turn')?.content).toBe('正在修复同步');
+  });
+});
+
+function performanceMessage(id: string, role: RemoteMessage['role']): RemoteMessage {
+  return { id, threadId: 'thread', role, content: id, createdAt: 1, status: 'complete' };
+}
+
+describe('Long conversation performance guards', () => {
+  it('mounts only the configured tail window while retaining an explicit older-entry count', () => {
+    const entries = groupConsecutiveToolMessages(Array.from({ length: 1_000 }, (_, index) => (
+      performanceMessage(`message-${index}`, index % 2 === 0 ? 'user' : 'assistant')
+    )));
+    const window = conversationEntryWindow(entries, DEFAULT_RENDERED_ENTRY_LIMIT);
+    expect(entries).toHaveLength(1_000);
+    expect(window.entries).toHaveLength(DEFAULT_RENDERED_ENTRY_LIMIT);
+    expect(window.hiddenCount).toBe(1_000 - DEFAULT_RENDERED_ENTRY_LIMIT);
+    expect(window.entries[0]?.type === 'message' ? window.entries[0].message.id : '').toBe(`message-${1_000 - DEFAULT_RENDERED_ENTRY_LIMIT}`);
+  });
+
+  it('keeps a frozen reading window bounded while new tail entries accumulate', () => {
+    const initial = groupConsecutiveToolMessages(Array.from({ length: 80 }, (_, index) => (
+      performanceMessage(`frozen-${index}`, index % 2 === 0 ? 'user' : 'assistant')
+    )));
+    const appended = groupConsecutiveToolMessages([
+      ...Array.from({ length: 80 }, (_, index) => performanceMessage(`frozen-${index}`, index % 2 === 0 ? 'user' : 'assistant')),
+      ...Array.from({ length: 500 }, (_, index) => performanceMessage(`new-${index}`, index % 2 === 0 ? 'user' : 'assistant')),
+    ]);
+    const frozen = conversationEntryWindow(appended, DEFAULT_RENDERED_ENTRY_LIMIT, initial.length);
+    expect(frozen.entries).toHaveLength(DEFAULT_RENDERED_ENTRY_LIMIT);
+    expect(frozen.hiddenAfter).toBe(500);
+    expect(frozen.entries.at(-1)?.type === 'message' ? frozen.entries.at(-1)?.message.id : '').toBe('frozen-79');
+  });
+
+  it('detects a non-tail visible message replacement without scanning hidden history', () => {
+    const first = performanceMessage('visible-first', 'assistant');
+    const last = performanceMessage('visible-last', 'assistant');
+    const before = groupConsecutiveToolMessages([first, last]);
+    const after = groupConsecutiveToolMessages([{ ...first, content: 'same length!!!' }, last]);
+    expect(visibleConversationContentKey(after, new Set(), []))
+      .not.toBe(visibleConversationContentKey(before, new Set(), []));
+  });
+
+  it('reuses parsed agent target arrays for unchanged message objects', () => {
+    const agent = performanceMessage('agent-stable', 'tool');
+    agent.itemType = 'collabAgentToolCall';
+    agent.detail = {
+      receiverThreadIds: ['child-stable'],
+      agentsStates: { 'child-stable': { nickname: 'Stable', status: 'running' } },
+    };
+    const first = groupConsecutiveToolMessages([agent])[0];
+    const second = groupConsecutiveToolMessages([agent])[0];
+    expect(first?.type).toBe('message');
+    expect(second?.type).toBe('message');
+    if (first?.type === 'message' && second?.type === 'message') {
+      expect(second.agentTargets).toBe(first.agentTargets);
+    }
+  });
+
+  it('groups a large history within a bounded synchronous budget', () => {
+    const history = Array.from({ length: 5_000 }, (_, index) => {
+      const item = performanceMessage(`perf-${index}`, index % 5 === 0 ? 'assistant' : 'tool');
+      item.content = `output ${index}`;
+      return item;
+    });
+    const startedAt = performance.now();
+    const entries = groupConsecutiveToolMessages(history);
+    const elapsedMs = performance.now() - startedAt;
+    expect(entries.length).toBeGreaterThan(0);
+    expect(elapsedMs).toBeLessThan(500);
   });
 });

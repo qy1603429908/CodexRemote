@@ -168,6 +168,7 @@ export function App() {
     <>
       {remote.selectedThread ? (
         <ConversationScreen
+          key={remote.selectedThread.id}
           thread={remote.selectedThread}
           messages={remote.selectedMessages}
           subagents={remote.selectedSubagents}

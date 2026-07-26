@@ -60,17 +60,27 @@ export function isContextMessage(message: RemoteMessage): boolean {
 
 export function latestReasoning(messages: RemoteMessage[], currentTurnId?: string): RemoteMessage | undefined {
   if (!currentTurnId) return undefined;
-  return [...messages].reverse().find((message) => {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index]!;
     const isReasoning = message.itemType?.toLowerCase().includes('reasoning');
     const isDetail = message.toolName === '思考详情' || message.id.endsWith('_detail');
-    return message.turnId === currentTurnId && message.status === 'streaming' && isReasoning && !isDetail;
-  });
+    if (message.turnId === currentTurnId && message.status === 'streaming' && isReasoning && !isDetail) return message;
+  }
+  return undefined;
+}
+
+function latestPlanContent(messages: RemoteMessage[]): string {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index]!;
+    if (isPlan(message)) return message.content.trim();
+  }
+  return '';
 }
 
 export function ConversationContextPanel({ thread, messages }: { thread: RemoteThread; messages: RemoteMessage[] }) {
   const [expanded, setExpanded] = useState(false);
   const goal = useMemo(() => findGoal(thread.source), [thread.source]);
-  const plan = useMemo(() => [...messages].reverse().find(isPlan)?.content.trim() ?? '', [messages]);
+  const plan = useMemo(() => latestPlanContent(messages), [messages]);
   const progress = useMemo(() => checklistCount(plan), [plan]);
 
   if (!goal && !plan) return null;

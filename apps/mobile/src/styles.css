@@ -733,3 +733,14 @@ html { -webkit-text-size-adjust: 100%; }
 .git-diff-panel { margin-left: calc(var(--app-safe-left) + 12px); margin-right: calc(var(--app-safe-right) + 12px); }
 .project-threads .subagent-toggle { max-width: 100%; }
 .new-content-button { right: calc(var(--app-safe-right) + 13px); }
+
+/* Long conversations: keep off-screen rows out of Android WebView layout/paint work.
+   The intrinsic size is remembered after first layout, reducing scrollbar jumps. */
+@supports (content-visibility: auto) {
+  .message-row,
+  .tool-call-group,
+  .approval-card {
+    content-visibility: auto;
+    contain-intrinsic-block-size: auto 132px;
+  }
+}

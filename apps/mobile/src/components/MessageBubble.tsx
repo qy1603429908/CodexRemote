@@ -97,13 +97,51 @@ function AttachmentGallery({ message, onLoad, onDownload }: {
   ))}</div>;
 }
 
-export const MessageBubble = memo(function MessageBubble({ message, agentTargets = [], onOpenAgent, onLoadAttachment, onDownloadAttachment }: {
+interface MessageBubbleProps {
   message: RemoteMessage;
   agentTargets?: Array<{ id: string; label: string; state: string }>;
   onOpenAgent?: (agentId: string) => void;
   onLoadAttachment?: (path: string) => Promise<LoadedAttachment>;
   onDownloadAttachment?: (path: string) => void;
-}) {
+}
+
+function sameAgentTargets(left: MessageBubbleProps['agentTargets'], right: MessageBubbleProps['agentTargets']): boolean {
+  if (left === right) return true;
+  if ((left?.length ?? 0) !== (right?.length ?? 0)) return false;
+  return (left ?? []).every((agent, index) => {
+    const other = right?.[index];
+    return agent.id === other?.id && agent.label === other.label && agent.state === other.state;
+  });
+}
+
+function sameAttachments(left: RemoteMessage['attachments'], right: RemoteMessage['attachments']): boolean {
+  if (left === right) return true;
+  if ((left?.length ?? 0) !== (right?.length ?? 0)) return false;
+  return (left ?? []).every((attachment, index) => {
+    const other = right?.[index];
+    return attachment.path === other?.path && attachment.name === other.name
+      && attachment.type === other.type && attachment.mimeType === other.mimeType;
+  });
+}
+
+export function messageBubblePropsEqual(previous: MessageBubbleProps, next: MessageBubbleProps): boolean {
+  const left = previous.message;
+  const right = next.message;
+  const messageEqual = left === right || (
+    left.id === right.id && left.role === right.role && left.content === right.content
+    && left.status === right.status && left.createdAt === right.createdAt
+    && left.completedAt === right.completedAt && left.durationMs === right.durationMs
+    && left.itemType === right.itemType && left.toolName === right.toolName
+    && left.collapsible === right.collapsible && left.detail === right.detail
+    && sameAttachments(left.attachments, right.attachments)
+  );
+  return messageEqual && sameAgentTargets(previous.agentTargets, next.agentTargets)
+    && previous.onOpenAgent === next.onOpenAgent
+    && previous.onLoadAttachment === next.onLoadAttachment
+    && previous.onDownloadAttachment === next.onDownloadAttachment;
+}
+
+export const MessageBubble = memo(function MessageBubble({ message, agentTargets = [], onOpenAgent, onLoadAttachment, onDownloadAttachment }: MessageBubbleProps) {
   const [detailsOpen, setDetailsOpen] = useState(message.status === 'streaming');
   useEffect(() => {
     if (message.status === 'streaming') setDetailsOpen(true);
@@ -185,4 +223,4 @@ export const MessageBubble = memo(function MessageBubble({ message, agentTargets
       </div>
     </article>
   );
-});
+}, messageBubblePropsEqual);
