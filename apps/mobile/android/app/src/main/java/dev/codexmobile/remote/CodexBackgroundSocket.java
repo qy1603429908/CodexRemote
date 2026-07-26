@@ -167,7 +167,10 @@ final class CodexBackgroundSocket {
         if (stopped || serverUrl.isEmpty() || socket != null) return;
         try {
             String token = SecureTokenPlugin.readStoredValue(context, TOKEN_KEY);
-            if (token == null || token.isEmpty()) return;
+            if (token == null || token.isEmpty()) {
+                scheduleReconnect();
+                return;
+            }
             String wsUrl = websocketUrl(serverUrl);
             String encodedToken = Base64.encodeToString(
                     token.getBytes(StandardCharsets.UTF_8),

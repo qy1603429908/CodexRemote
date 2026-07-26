@@ -5,7 +5,7 @@ import { RemoteSocket } from '../lib/RemoteSocket';
 import { cancelApprovalNotification, cancelThreadAttentionNotification, notifyApprovalRequested, notifyCompactionFailed, notifyThreadAttention, notifyTurnFinished } from '../lib/notifications';
 import { downloadHostFile, saveHostFile, uploadRemoteFile } from '../lib/fileTransfer';
 import { NotificationGenerationGuard, NotificationOperationQueue, settleGuardedNotification } from '../lib/notificationGuard';
-import { cacheScope, clearRemoteCache, loadRemoteCache, saveRemoteCache, type CachedHistoryState, type RemoteCacheSnapshot } from '../lib/remoteCache';
+import { cacheScope, clearRemoteCache, loadRemoteCache, messagesForThread, saveRemoteCache, type CachedHistoryState, type RemoteCacheSnapshot } from '../lib/remoteCache';
 import type {
   ApprovalDecision,
   ApprovalRequest,
@@ -37,6 +37,11 @@ function stringValue(...values: unknown[]): string | undefined {
   return values.find((value): value is string => typeof value === 'string' && value.length > 0);
 }
 
+function explicitThreadOwner(value: unknown): string | undefined {
+  const data = record(value);
+  return stringValue(data?.threadId, data?.conversationId, data?.ownerThreadId, data?.ownerConversationId);
+}
+
 
 export function visibleUserText(value: string): string {
   const normalized = value.replace(/\r\n?/g, '\n');
@@ -61,6 +66,13 @@ function timestamp(value: unknown, fallback = Date.now()): number {
     if (Number.isFinite(parsed)) return parsed;
   }
   return fallback;
+}
+
+export function consumeThreadActivationIntent(
+  pendingStartRequestIds: Set<string>,
+  requestId: string | undefined,
+): boolean {
+  return Boolean(requestId && pendingStartRequestIds.delete(requestId));
 }
 
 function upsertById<T extends { id: string }>(items: T[], item: T): T[] {
@@ -525,15 +537,18 @@ export function reconcileMessages(
   current: RemoteMessage[],
   incoming: RemoteMessage[],
   placement: 'append' | 'prepend' = 'append',
+  targetThreadId = incoming[0]?.threadId ?? current[0]?.threadId,
 ): RemoteMessage[] {
-  if (incoming.length === 0) return current;
-  const authoritative = dedupeMessages(incoming);
+  const ownedCurrent = targetThreadId ? messagesForThread(targetThreadId, current) : [];
+  const ownedIncoming = targetThreadId ? messagesForThread(targetThreadId, incoming) : [];
+  if (ownedIncoming.length === 0) return ownedCurrent;
+  const authoritative = dedupeMessages(ownedIncoming);
   const incomingIds = new Set(authoritative.map((message) => message.id));
   const incomingCorrelations = new Set(authoritative.flatMap(messageCorrelationIds));
   const overlaps = (message: RemoteMessage) => incomingIds.has(message.id)
     || messageCorrelationIds(message).some((id) => incomingCorrelations.has(id));
-  const overlapIndexes = current.flatMap((message, index) => overlaps(message) ? [index] : []);
-  const withoutReplacedCanonical = current.filter((message) => !overlaps(message));
+  const overlapIndexes = ownedCurrent.flatMap((message, index) => overlaps(message) ? [index] : []);
+  const withoutReplacedCanonical = ownedCurrent.filter((message) => !overlaps(message));
   const preserved = withoutOptimisticMatches(withoutReplacedCanonical, authoritative);
 
   // The wire arrays are the canonical order. Timestamps are turn-level fallbacks and
@@ -544,7 +559,7 @@ export function reconcileMessages(
   if (placement === 'prepend') return dedupeMessages([...authoritative, ...preserved]);
   if (overlapIndexes.length === 0) return dedupeMessages([...preserved, ...authoritative]);
   const firstOverlap = Math.min(...overlapIndexes);
-  const beforeIds = new Set(current.slice(0, firstOverlap).map((message) => message.id));
+  const beforeIds = new Set(ownedCurrent.slice(0, firstOverlap).map((message) => message.id));
   const before = preserved.filter((message) => beforeIds.has(message.id));
   const after = preserved.filter((message) => !beforeIds.has(message.id));
   return dedupeMessages([...before, ...authoritative, ...after]);
@@ -552,27 +567,47 @@ export function reconcileMessages(
 
 
 
-export function reconcileThreadSnapshot(current: RemoteMessage[], incoming: RemoteMessage[]): RemoteMessage[] {
-  if (incoming.length === 0) return current;
-  const currentById = new Map(current.map((message) => [message.id, message]));
-  const authoritative = dedupeMessages(incoming)
+export function reconcileThreadSnapshot(
+  current: RemoteMessage[],
+  incoming: RemoteMessage[],
+  targetThreadId = incoming[0]?.threadId ?? current[0]?.threadId,
+): RemoteMessage[] {
+  const ownedCurrent = targetThreadId ? messagesForThread(targetThreadId, current) : [];
+  const ownedIncoming = targetThreadId ? messagesForThread(targetThreadId, incoming) : [];
+  if (ownedIncoming.length === 0) return ownedCurrent;
+  const currentById = new Map(ownedCurrent.map((message) => [message.id, message]));
+  const authoritative = dedupeMessages(ownedIncoming)
     .map((message) => preserveFresherLiveMessage(currentById.get(message.id), message));
   const coveredTurnIds = [...new Set(authoritative.flatMap((message) => message.turnId ? [message.turnId] : []))];
-  if (coveredTurnIds.length === 0) return reconcileMessages(current, authoritative);
+  if (coveredTurnIds.length === 0) return reconcileMessages(ownedCurrent, authoritative, 'append', targetThreadId);
 
   const incomingIds = new Set(authoritative.map((message) => message.id));
   const incomingCorrelations = new Set(authoritative.flatMap(messageCorrelationIds));
   const overlaps = (message: RemoteMessage) => incomingIds.has(message.id)
     || messageCorrelationIds(message).some((id) => incomingCorrelations.has(id));
   const cleanedCurrent = withoutProjectedMessageAliases(
-    withoutOptimisticMatches(current, authoritative),
+    withoutOptimisticMatches(ownedCurrent, authoritative),
     authoritative,
   );
   const covered = new Set(coveredTurnIds);
+  const authoritativeByTurn = new Map<string, RemoteMessage[]>();
+  for (const message of authoritative) {
+    if (!message.turnId) continue;
+    const bucket = authoritativeByTurn.get(message.turnId) ?? [];
+    bucket.push(message);
+    authoritativeByTurn.set(message.turnId, bucket);
+  }
+  const liveTailByTurn = new Map<string, RemoteMessage[]>();
+  for (const message of cleanedCurrent) {
+    if (!message.turnId || !covered.has(message.turnId) || overlaps(message)) continue;
+    const bucket = liveTailByTurn.get(message.turnId) ?? [];
+    bucket.push(message);
+    liveTailByTurn.set(message.turnId, bucket);
+  }
   const mergedByTurn = new Map<string, RemoteMessage[]>();
 
   for (const turnId of coveredTurnIds) {
-    const canonical = authoritative.filter((message) => message.turnId === turnId);
+    const canonical = authoritativeByTurn.get(turnId) ?? [];
     // A Desktop snapshot is the canonical prefix for this turn. Only exact semantic
     // aliases of canonical messages are removed above; unmatched live items retain their
     // opaque IDs and stay in the event tail until a later snapshot includes them.
@@ -581,8 +616,7 @@ export function reconcileThreadSnapshot(current: RemoteMessage[], incoming: Remo
       const type = message.itemType?.toLowerCase() ?? '';
       return type.includes('plan') || type.includes('todo');
     });
-    const eventTail = cleanedCurrent.filter((message) => {
-      if (message.turnId !== turnId || overlaps(message)) return false;
+    const eventTail = (liveTailByTurn.get(turnId) ?? []).filter((message) => {
       const type = message.itemType?.toLowerCase() ?? '';
       // Desktop snapshots are authoritative for transient reasoning/plan state. Event
       // aliases often use synthetic IDs, so retaining an older unmatched delta after the
@@ -633,7 +667,7 @@ export function normalizeThreadPayload(payload: unknown): {
   const outer = record(payload);
   const threadData = record(outer?.thread) ?? outer;
   if (!threadData) return { thread: null, messages: [] };
-  const id = stringValue(threadData.id, threadData.threadId);
+  const id = stringValue(threadData.id, threadData.threadId, threadData.conversationId);
   if (!id) return { thread: null, messages: [] };
   const turns = Array.isArray(threadData.turns) ? threadData.turns : [];
   const messages: RemoteMessage[] = [];
@@ -642,10 +676,16 @@ export function normalizeThreadPayload(payload: unknown): {
   turns.forEach((turnValue, turnIndex) => {
     const turn = record(turnValue);
     if (!turn) return;
+    const turnOwner = explicitThreadOwner(turn);
+    if (turnOwner && turnOwner !== id) return;
     const turnId = stringValue(turn.id, turn.turnId) ?? `turn_${turnIndex}`;
     const turnStatus = String(turn.status ?? '').toLowerCase();
     if (turnStatus.includes('progress')) currentTurnId = turnId;
-    const items = canonicalProjectedItems(Array.isArray(turn.items) ? turn.items : []);
+    const ownedItems = (Array.isArray(turn.items) ? turn.items : []).filter((item) => {
+      const itemOwner = explicitThreadOwner(item);
+      return !itemOwner || itemOwner === id;
+    });
+    const items = canonicalProjectedItems(ownedItems);
     items.forEach((item, itemIndex) => {
       const message = itemToMessage(item, id, turnId, itemIndex, timestamp(turn.startedAt ?? turn.turnStartedAtMs ?? turn.startedAtMs, 0), turnStatus.includes('progress'));
       if (message) messages.push(message);
@@ -701,9 +741,25 @@ function normalizeApproval(approval: WireApprovalRequest): ApprovalRequest {
   };
 }
 
-function eventThreadId(params: UnknownRecord | null): string | undefined {
+export function eventThreadId(params: UnknownRecord | null): string | undefined {
   const nestedThread = record(params?.thread);
-  return stringValue(params?.threadId, nestedThread?.id);
+  const nestedConversation = record(params?.conversation);
+  const nestedTurn = record(params?.turn);
+  const nestedItem = record(params?.item);
+  return stringValue(
+    params?.threadId,
+    params?.conversationId,
+    nestedThread?.id,
+    nestedThread?.threadId,
+    nestedThread?.conversationId,
+    nestedConversation?.id,
+    nestedTurn?.threadId,
+    nestedTurn?.conversationId,
+    nestedItem?.threadId,
+    nestedItem?.conversationId,
+    nestedItem?.ownerThreadId,
+    nestedItem?.ownerConversationId,
+  );
 }
 
 function eventTurnId(params: UnknownRecord | null): string | undefined {
@@ -828,6 +884,7 @@ export function useRemote(config: RemoteConfig | null) {
   const compactionsRef = useRef<Record<string, CompactionStatus>>({});
   const compactionTurnIdsRef = useRef<Record<string, Set<string>>>({});
   const pendingCompactionRequestsRef = useRef<Map<string, string>>(new Map());
+  const pendingThreadStartRequestsRef = useRef<Set<string>>(new Set());
   const notifiedCompactionFailuresRef = useRef<Set<string>>(new Set());
   const seenCompactionItemsRef = useRef<Record<string, Map<string, boolean | undefined>>>({});
   const [historyByThread, setHistoryByThread] = useState<Record<string, CachedHistoryState>>({});
@@ -1065,7 +1122,7 @@ export function useRemote(config: RemoteConfig | null) {
     (threadId: string, turnId: string | undefined, itemId: string, delta: string, role: RemoteMessage['role'], toolName?: string, itemType?: string) => {
       if (!delta) return;
       setMessagesByThread((current) => {
-        const items = [...(current[threadId] ?? [])];
+        const items = [...messagesForThread(threadId, current[threadId] ?? [])];
         const index = items.findIndex((item) => item.id === itemId);
         if (index >= 0) {
           items[index] = { ...items[index], turnId: items[index].turnId ?? turnId, content: items[index].content + delta, status: 'streaming', ...(toolName ? { toolName } : {}), ...(itemType ? { itemType } : {}) };
@@ -1091,7 +1148,7 @@ export function useRemote(config: RemoteConfig | null) {
   const handleEvent = useCallback(
     (method: string, rawParams: unknown) => {
       const params = record(rawParams);
-      const threadId = eventThreadId(params) ?? selectedThreadRef.current ?? undefined;
+      const threadId = eventThreadId(params);
       const turnId = eventTurnId(params);
       const item = record(params?.item);
       const itemId = stringValue(params?.itemId, item?.id) ?? `${turnId ?? 'turn'}_${method}`;
@@ -1104,7 +1161,7 @@ export function useRemote(config: RemoteConfig | null) {
           if (latestTodo) setTodoByThread((current) => ({ ...current, [normalized.thread!.id]: latestTodo }));
           replaceThreadsAndSyncAttention(sortThreads(upsertById(threadsRef.current, normalized.thread!)));
           if (selectedThreadRef.current === normalized.thread.id) {
-            setMessagesByThread((current) => ({ ...current, [normalized.thread!.id]: reconcileThreadSnapshot(current[normalized.thread!.id] ?? [], normalized.messages) }));
+            setMessagesByThread((current) => ({ ...current, [normalized.thread!.id]: reconcileThreadSnapshot(current[normalized.thread!.id] ?? [], normalized.messages, normalized.thread!.id) }));
             if (normalized.thread.model) setSelectedModelState(normalized.thread.model);
             if (normalized.thread.effort) setSelectedEffortState(normalized.thread.effort);
             if (normalized.thread.permissionMode) setSelectedPermissionModeState(normalized.thread.permissionMode);
@@ -1195,7 +1252,7 @@ export function useRemote(config: RemoteConfig | null) {
           return updated;
         });
         setMessagesByThread((current) => {
-          const completed = (current[threadId] ?? []).map((message) =>
+          const completed = messagesForThread(threadId, current[threadId] ?? []).map((message) =>
             message.status === 'streaming'
               ? { ...message, status: failed ? ('failed' as const) : ('complete' as const), completedAt: Date.now() }
               : message,
@@ -1296,7 +1353,7 @@ export function useRemote(config: RemoteConfig | null) {
           setTodoByThread((current) => ({ ...current, [threadId]: planMessage }));
           setMessagesByThread((current) => ({
             ...current,
-            [threadId]: upsertById(current[threadId] ?? [], planMessage),
+            [threadId]: upsertById(messagesForThread(threadId, current[threadId] ?? []), planMessage),
           }));
         }
         return;
@@ -1320,7 +1377,7 @@ export function useRemote(config: RemoteConfig | null) {
           normalized.status = 'streaming';
           setMessagesByThread((current) => ({
             ...current,
-            [threadId]: dedupeMessages(upsertById(current[threadId] ?? [], normalized)),
+            [threadId]: dedupeMessages(upsertById(messagesForThread(threadId, current[threadId] ?? []), normalized)),
           }));
         }
         return;
@@ -1368,8 +1425,8 @@ export function useRemote(config: RemoteConfig | null) {
             ...current,
             [threadId]: dedupeMessages(upsertById(
               normalized.role === 'user'
-                ? withoutOptimisticMatches(current[threadId] ?? [], [normalized])
-                : (current[threadId] ?? []),
+                ? withoutOptimisticMatches(messagesForThread(threadId, current[threadId] ?? []), [normalized])
+                : messagesForThread(threadId, current[threadId] ?? []),
               normalized,
             )),
           }));
@@ -1403,7 +1460,7 @@ export function useRemote(config: RemoteConfig | null) {
         const threadId = selectedThreadRef.current;
         if (threadId) socketRef.current?.send({
           type: 'thread.open', requestId: createRequestId('open-reset'), threadId,
-          historyLimit: 20, knownTurnIds: knownTurnIds(messagesByThreadRef.current[threadId] ?? []),
+          historyLimit: 20, knownTurnIds: knownTurnIds(messagesForThread(threadId, messagesByThreadRef.current[threadId] ?? [])),
         });
         return;
       }
@@ -1450,7 +1507,7 @@ export function useRemote(config: RemoteConfig | null) {
             const selected = selectedThreadRef.current;
             socketRef.current?.send({
               type: 'thread.open', requestId: createRequestId('open'), threadId: selected,
-              historyLimit: 20, knownTurnIds: knownTurnIds(messagesByThreadRef.current[selected] ?? []),
+              historyLimit: 20, knownTurnIds: knownTurnIds(messagesForThread(selected, messagesByThreadRef.current[selected] ?? [])),
             });
             socketRef.current?.send({ type: 'thread.diff.get', requestId: createRequestId('diff'), threadId: selected });
           }
@@ -1545,7 +1602,7 @@ export function useRemote(config: RemoteConfig | null) {
           replaceThreadsAndSyncAttention(sortThreads(upsertById(threadsRef.current, normalized.thread!)));
           setMessagesByThread((current) => ({
             ...current,
-            [normalized.thread!.id]: reconcileMessages(current[normalized.thread!.id] ?? [], normalized.messages),
+            [normalized.thread!.id]: reconcileMessages(current[normalized.thread!.id] ?? [], normalized.messages, 'append', normalized.thread!.id),
           }));
           if (message.history) setHistoryByThread((current) => ({
             ...current,
@@ -1553,17 +1610,26 @@ export function useRemote(config: RemoteConfig | null) {
           }));
           setHistoryLoadingByThread((current) => ({ ...current, [normalized.thread!.id]: false }));
           setTurnIds((current) => turnIdsAfterSnapshot(current, normalized.thread!.id, normalized.currentTurnId));
-          if (normalized.thread.model) setSelectedModelState(normalized.thread.model);
-          if (normalized.thread.effort) setSelectedEffortState(normalized.thread.effort);
-          if (normalized.thread.permissionMode) setSelectedPermissionModeState(normalized.thread.permissionMode);
-          if (!selectedThreadRef.current) setSelectedThreadId(normalized.thread.id);
+          const activatesThread = consumeThreadActivationIntent(
+            pendingThreadStartRequestsRef.current,
+            message.requestId,
+          );
+          if (activatesThread) {
+            selectedThreadRef.current = normalized.thread.id;
+            setSelectedThreadId(normalized.thread.id);
+          }
+          if (selectedThreadRef.current === normalized.thread.id) {
+            if (normalized.thread.model) setSelectedModelState(normalized.thread.model);
+            if (normalized.thread.effort) setSelectedEffortState(normalized.thread.effort);
+            if (normalized.thread.permissionMode) setSelectedPermissionModeState(normalized.thread.permissionMode);
+          }
           break;
         }
         case 'thread.history': {
           const normalized = normalizeThreadPayload({ thread: { id: message.threadId, turns: message.turns } });
           setMessagesByThread((current) => ({
             ...current,
-            [message.threadId]: reconcileMessages(current[message.threadId] ?? [], normalized.messages, 'prepend'),
+            [message.threadId]: reconcileMessages(current[message.threadId] ?? [], normalized.messages, 'prepend', message.threadId),
           }));
           setHistoryByThread((current) => ({ ...current, [message.threadId]: { ...message.history, loaded: true } }));
           setHistoryLoadingByThread((current) => ({ ...current, [message.threadId]: false }));
@@ -1642,7 +1708,10 @@ export function useRemote(config: RemoteConfig | null) {
         }
         case 'error': {
           const compactionThreadId = message.requestId ? pendingCompactionRequestsRef.current.get(message.requestId) : undefined;
-          if (message.requestId) pendingCompactionRequestsRef.current.delete(message.requestId);
+          if (message.requestId) {
+            pendingCompactionRequestsRef.current.delete(message.requestId);
+            pendingThreadStartRequestsRef.current.delete(message.requestId);
+          }
           if (compactionThreadId) reportCompactionFailure(compactionThreadId, `[${message.code}] ${message.message}`);
           else setLastError(`[${message.code}] ${message.message}`);
           break;
@@ -1693,6 +1762,7 @@ export function useRemote(config: RemoteConfig | null) {
     compactionsRef.current = {};
     compactionTurnIdsRef.current = {};
     pendingCompactionRequestsRef.current.clear();
+    pendingThreadStartRequestsRef.current.clear();
     notifiedCompactionFailuresRef.current.clear();
     seenCompactionItemsRef.current = {};
 
@@ -1802,7 +1872,7 @@ export function useRemote(config: RemoteConfig | null) {
     setHistoryLoadingByThread((current) => ({ ...current, [threadId]: true }));
     const sent = socketRef.current?.send({
       type: 'thread.open', requestId: createRequestId('open'), threadId,
-      historyLimit: 20, knownTurnIds: knownTurnIds(messagesByThreadRef.current[threadId] ?? []),
+      historyLimit: 20, knownTurnIds: knownTurnIds(messagesForThread(threadId, messagesByThreadRef.current[threadId] ?? [])),
     });
     if (!sent) setHistoryLoadingByThread((current) => ({ ...current, [threadId]: false }));
     socketRef.current?.send({ type: 'thread.diff.get', requestId: createRequestId('diff'), threadId });
@@ -1819,7 +1889,7 @@ export function useRemote(config: RemoteConfig | null) {
     const sent = socketRef.current?.send({
       type: 'thread.history', requestId: createRequestId('history'), threadId,
       cursor: history.nextCursor ?? undefined, limit: 20,
-      knownTurnIds: knownTurnIds(messagesByThreadRef.current[threadId] ?? []),
+      knownTurnIds: knownTurnIds(messagesForThread(threadId, messagesByThreadRef.current[threadId] ?? [])),
     });
     if (!sent) setHistoryLoadingByThread((current) => ({ ...current, [threadId]: false }));
   }, [historyLoadingByThread]);
@@ -1840,7 +1910,7 @@ export function useRemote(config: RemoteConfig | null) {
         toolName: title,
         collapsible: true,
       };
-      setMessagesByThread((current) => ({ ...current, [threadId]: [...(current[threadId] ?? []), localMessage] }));
+      setMessagesByThread((current) => ({ ...current, [threadId]: [...messagesForThread(threadId, current[threadId] ?? []), localMessage] }));
     };
 
     const downloadMatch = text.match(/^\/download\s+(.+)$/i);
@@ -2022,7 +2092,7 @@ export function useRemote(config: RemoteConfig | null) {
       };
       setMessagesByThread((current) => ({
         ...current,
-        [threadId]: [...(current[threadId] ?? []), optimistic],
+        [threadId]: [...messagesForThread(threadId, current[threadId] ?? []), optimistic],
       }));
       updateThreadState(threadId, 'running');
     }
@@ -2088,15 +2158,17 @@ export function useRemote(config: RemoteConfig | null) {
       setLastError('工作目录必须是电脑上的绝对路径');
       return false;
     }
-    return Boolean(
-      socketRef.current?.send({
-        type: 'thread.start',
-        requestId: createRequestId('thread'),
-        cwd: normalizedCwd,
-        ...(model?.trim() ? { model: model.trim() } : {}),
-        ...(modelProvider?.trim() ? { modelProvider: modelProvider.trim() } : {}),
-      }),
-    );
+    const requestId = createRequestId('thread');
+    pendingThreadStartRequestsRef.current.add(requestId);
+    const sent = socketRef.current?.send({
+      type: 'thread.start',
+      requestId,
+      cwd: normalizedCwd,
+      ...(model?.trim() ? { model: model.trim() } : {}),
+      ...(modelProvider?.trim() ? { modelProvider: modelProvider.trim() } : {}),
+    });
+    if (!sent) pendingThreadStartRequestsRef.current.delete(requestId);
+    return Boolean(sent);
   }, []);
 
   const selectModel = useCallback((modelId: string) => {
@@ -2190,6 +2262,7 @@ export function useRemote(config: RemoteConfig | null) {
     compactionsRef.current = {};
     compactionTurnIdsRef.current = {};
     pendingCompactionRequestsRef.current.clear();
+    pendingThreadStartRequestsRef.current.clear();
     notifiedCompactionFailuresRef.current.clear();
     seenCompactionItemsRef.current = {};
     serverIdRef.current = undefined;
@@ -2217,9 +2290,15 @@ export function useRemote(config: RemoteConfig | null) {
     () => threads.find((thread) => thread.id === selectedThreadId) ?? null,
     [selectedThreadId, threads],
   );
-  const selectedMessages = selectedThreadId
-    ? dedupeMessages([...(messagesByThread[selectedThreadId] ?? []), ...(todoByThread[selectedThreadId] ? [todoByThread[selectedThreadId]] : [])])
-    : [];
+  const selectedMessages = useMemo(
+    () => selectedThreadId
+      ? dedupeMessages(messagesForThread(
+          selectedThreadId,
+          [...(messagesByThread[selectedThreadId] ?? []), ...(todoByThread[selectedThreadId] ? [todoByThread[selectedThreadId]] : [])],
+        ))
+      : [],
+    [messagesByThread, selectedThreadId, todoByThread],
+  );
   const selectedCompaction = selectedThreadId ? (compactionsByThread[selectedThreadId] ?? null) : null;
   const selectedPromptQueue = selectedThreadId ? (promptQueueByThread[selectedThreadId] ?? []) : [];
   const selectedGitDiff = selectedThreadId ? (gitDiffByThread[selectedThreadId] ?? null) : null;

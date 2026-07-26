@@ -2,6 +2,10 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 
 const css = readFileSync(new URL('../src/styles.css', import.meta.url), 'utf8');
+const conversationSource = readFileSync(new URL('../src/components/ConversationScreen.tsx', import.meta.url), 'utf8');
+const threadListSource = readFileSync(new URL('../src/components/ThreadList.tsx', import.meta.url), 'utf8');
+const markdownSource = readFileSync(new URL('../src/components/Markdown.tsx', import.meta.url), 'utf8');
+const messageBubbleSource = readFileSync(new URL('../src/components/MessageBubble.tsx', import.meta.url), 'utf8');
 
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -68,6 +72,57 @@ describe('conversation horizontal overflow constraints', () => {
     expect(declarations('.diff-lines')).toMatch(/overflow:\s*auto/);
     expect(declarations('.attachment-strip')).toMatch(/overflow-x:\s*auto/);
     expect(declarations('.agent-strip')).toMatch(/overflow-x:\s*auto/);
+  });
+
+  it('preserves horizontal cutout insets in the wide and landscape layout overrides', () => {
+    expect(css).toMatch(/\.thread-list\s*\{\s*padding-inline:\s*calc\(var\(--app-safe-left\) \+ 20px\)\s+calc\(var\(--app-safe-right\) \+ 20px\)/);
+    expect(css).toMatch(/\.message-stream\s*\{\s*padding-inline:\s*calc\(var\(--app-safe-left\) \+ 28px\)\s+calc\(var\(--app-safe-right\) \+ 28px\)/);
+    expect(css).toMatch(/\.composer-shell\s*\{\s*padding-inline:\s*calc\(var\(--app-safe-left\) \+ 22px\)\s+calc\(var\(--app-safe-right\) \+ 22px\)/);
+  });
+
+  it('uses one explicit bottom anchor instead of letting every message row compete', () => {
+    expect(declarations('.message-stream')).toMatch(/overflow-anchor:\s*auto/);
+    expect(declarations('.message-row')).toMatch(/overflow-anchor:\s*none/);
+    expect(declarations('.message-stream-content > :last-child')).toMatch(/overflow-anchor:\s*auto/);
+  });
+});
+
+
+describe('Mobile long-list rendering', () => {
+  it('does not mount collapsed tool-group message bodies and keeps Subagent links in the summary block', () => {
+    expect(conversationSource).toMatch(/expandedToolGroupIds\.has\(entry\.id\)\s*&&\s*\(/);
+    expect(conversationSource).toMatch(/tool-group-agent-links/);
+    expect(conversationSource).toMatch(/tool-group-summary-agent/);
+    expect(conversationSource).toMatch(/event\.preventDefault\(\);[\s\S]*event\.stopPropagation\(\);[\s\S]*onOpenThread\(agent\.id\)/);
+    expect(conversationSource).not.toMatch(/const \[now, setNow\] = useState/);
+  });
+
+  it('keeps project Subagent toggles inside the project width at every recursive depth', () => {
+    const toggle = declarations('.subagent-toggle');
+    expect(toggle).toMatch(/width:\s*100%/);
+    expect(toggle).toMatch(/max-width:\s*100%/);
+    expect(toggle).toMatch(/min-width:\s*0/);
+    expect(toggle).toMatch(/box-sizing:\s*border-box/);
+    expect(toggle).toMatch(/overflow:\s*hidden/);
+    expect(toggle).toMatch(/var\(--thread-indent/);
+    expect(threadListSource).toMatch(/Math\.min\(depth,\s*4\)\s*\*\s*14/);
+    expect(threadListSource).toMatch(/className="subagent-toggle"[\s\S]*style=\{rowStyle\}/);
+    expect(css).not.toMatch(/\.subagent-toggle\s*\{[^}]*var\(--app-safe-(?:left|right)/);
+  });
+
+  it('keeps running clocks local instead of rerendering the complete task tree every second', () => {
+    expect(threadListSource).toMatch(/<ElapsedTime startedAt=\{thread\.currentTurnStartedAt\}/);
+    expect(threadListSource).not.toMatch(/const \[now, setNow\] = useState/);
+    expect(threadListSource).not.toMatch(/setInterval/);
+    expect(threadListSource).not.toMatch(/\bnow=\{now\}/);
+  });
+
+  it('memoizes Markdown and only mounts expensive collapsed details on demand', () => {
+    expect(markdownSource).toMatch(/export const Markdown = memo\(function Markdown/);
+    expect(messageBubbleSource).toMatch(/export const MessageBubble = memo\(function MessageBubble/);
+    expect(messageBubbleSource).toMatch(/detailsOpen && <div className="message-detail-content">/);
+    expect(messageBubbleSource).toMatch(/open && <pre><code>\{rawDetail\(detail\)\}/);
+    expect(messageBubbleSource).not.toMatch(/<code>\{rawDetail\(message\.detail\)\}/);
   });
 });
 

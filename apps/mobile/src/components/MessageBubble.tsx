@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { memo, useEffect, useState } from 'react';
 import type { RemoteAttachment, RemoteMessage } from '../types/protocol';
 import { DiffView } from './DiffView';
 import { Markdown } from './Markdown';
@@ -26,6 +26,16 @@ function rawDetail(detail: unknown): string {
   } catch {
     return String(detail);
   }
+}
+
+function RawEventDetails({ detail }: { detail: unknown }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <details className="raw-event" onToggle={(event) => setOpen(event.currentTarget.open)}>
+      <summary>原始事件</summary>
+      {open && <pre><code>{rawDetail(detail)}</code></pre>}
+    </details>
+  );
 }
 
 function firstLine(content: string): string {
@@ -87,13 +97,18 @@ function AttachmentGallery({ message, onLoad, onDownload }: {
   ))}</div>;
 }
 
-export function MessageBubble({ message, agentTargets = [], onOpenAgent, onLoadAttachment, onDownloadAttachment }: {
+export const MessageBubble = memo(function MessageBubble({ message, agentTargets = [], onOpenAgent, onLoadAttachment, onDownloadAttachment }: {
   message: RemoteMessage;
   agentTargets?: Array<{ id: string; label: string; state: string }>;
   onOpenAgent?: (agentId: string) => void;
   onLoadAttachment?: (path: string) => Promise<LoadedAttachment>;
   onDownloadAttachment?: (path: string) => void;
 }) {
+  const [detailsOpen, setDetailsOpen] = useState(message.status === 'streaming');
+  useEffect(() => {
+    if (message.status === 'streaming') setDetailsOpen(true);
+  }, [message.status]);
+
   const isUser = message.role === 'user';
   const isTool = message.role === 'tool';
   const normalizedType = message.itemType?.toLowerCase() ?? '';
@@ -105,13 +120,12 @@ export function MessageBubble({ message, agentTargets = [], onOpenAgent, onLoadA
   const duration = formatDuration(message.durationMs);
   const isDiff = message.toolName === '本轮 Diff' || /^diff --git /m.test(message.content);
   const inspectable = message.collapsible || isTool || isSubagent;
-  const mainBody = isDiff
-    ? <DiffView diff={message.content} />
-    : isTool
-      ? <pre><code>{message.content}</code></pre>
-      : <Markdown content={message.content} />;
-  const body = <>
-    {mainBody}
+  const body = () => <>
+    {isDiff
+      ? <DiffView diff={message.content} />
+      : isTool
+        ? <pre><code>{message.content}</code></pre>
+        : <Markdown content={message.content} />}
     <AttachmentGallery message={message} onLoad={onLoadAttachment} onDownload={onDownloadAttachment} />
   </>;
 
@@ -119,7 +133,11 @@ export function MessageBubble({ message, agentTargets = [], onOpenAgent, onLoadA
     <article className={`message-row role-${message.role} ${isSubagent ? 'is-subagent' : ''} ${message.status === 'failed' ? 'is-failed' : ''}`}>
       <div className="message-column">
         {inspectable ? (
-          <details className={`message-detail-card ${message.status === 'streaming' ? 'is-streaming' : ''}`} open={message.status === 'streaming'}>
+          <details
+            className={`message-detail-card ${message.status === 'streaming' ? 'is-streaming' : ''}`}
+            open={detailsOpen}
+            onToggle={(event) => setDetailsOpen(event.currentTarget.open)}
+          >
             <summary>
               <span className="event-disclosure" aria-hidden="true">›</span>
               <span className="event-kind">{isSubagent ? 'Subagent' : isDiff ? 'Diff' : '工具'}</span>
@@ -133,8 +151,8 @@ export function MessageBubble({ message, agentTargets = [], onOpenAgent, onLoadA
                 <time>{displayTime(message.createdAt)}</time>
               </span>
             </summary>
-            <div className="message-detail-content">{body}</div>
-            {message.detail != null && <details className="raw-event"><summary>原始事件</summary><pre><code>{rawDetail(message.detail)}</code></pre></details>}
+            {detailsOpen && <div className="message-detail-content">{body()}</div>}
+            {detailsOpen && message.detail != null && <RawEventDetails detail={message.detail} />}
             {message.status === 'streaming' && <span className="typing-caret" />}
           </details>
         ) : (
@@ -148,7 +166,7 @@ export function MessageBubble({ message, agentTargets = [], onOpenAgent, onLoadA
               </span>
             </header>
             <div className={`message-bubble ${message.status === 'streaming' ? 'is-streaming' : ''}`}>
-              {body}
+              {body()}
               {message.status === 'streaming' && <span className="typing-caret" />}
             </div>
           </>
@@ -167,4 +185,4 @@ export function MessageBubble({ message, agentTargets = [], onOpenAgent, onLoadA
       </div>
     </article>
   );
-}
+});

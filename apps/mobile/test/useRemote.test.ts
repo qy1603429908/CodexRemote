@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { canonicalProjectedItems, compactionStatusFromThreadPayload, contextCompactionItemIdsFromThreadPayload, dedupeMessages, normalizeThreadPayload, optimisticAttachmentsFromUploads, reconcileMessages, reconcileThreadSnapshot, stateFromStatus, turnIdsAfterSnapshot, visibleUserText } from '../src/hooks/useRemote';
+import { canonicalProjectedItems, compactionStatusFromThreadPayload, consumeThreadActivationIntent, contextCompactionItemIdsFromThreadPayload, dedupeMessages, eventThreadId, normalizeThreadPayload, optimisticAttachmentsFromUploads, reconcileMessages, reconcileThreadSnapshot, stateFromStatus, turnIdsAfterSnapshot, visibleUserText } from '../src/hooks/useRemote';
 import type { RemoteMessage } from '../src/types/protocol';
 
 function user(id: string, content: string, createdAt: number): RemoteMessage {
@@ -7,6 +7,60 @@ function user(id: string, content: string, createdAt: number): RemoteMessage {
 }
 
 describe('Desktop/mobile reconciliation', () => {
+  it('does not reactivate a task when a delayed open response arrives after returning to the list', () => {
+    const pendingStarts = new Set(['thread-start-request']);
+    expect(consumeThreadActivationIntent(pendingStarts, 'stale-open-request')).toBe(false);
+    expect(pendingStarts).toEqual(new Set(['thread-start-request']));
+    expect(consumeThreadActivationIntent(pendingStarts, 'thread-start-request')).toBe(true);
+    expect(consumeThreadActivationIntent(pendingStarts, 'thread-start-request')).toBe(false);
+  });
+
+  it('never assigns an event without an explicit thread identity to the currently visible task', () => {
+    expect(eventThreadId({})).toBeUndefined();
+    expect(eventThreadId({ conversationId: 'subagent-thread' })).toBe('subagent-thread');
+    expect(eventThreadId({ thread: { id: 'nested-thread' } })).toBe('nested-thread');
+    expect(eventThreadId({ turn: { threadId: 'turn-owner' } })).toBe('turn-owner');
+    expect(eventThreadId({ item: { ownerConversationId: 'item-owner' } })).toBe('item-owner');
+  });
+
+  it('removes foreign messages while reconciling a thread bucket', () => {
+    const ownedCurrent = user('owned-current', 'child current', 1);
+    const foreignCurrent = { ...user('foreign-current', 'parent current', 2), threadId: 'parent' };
+    const ownedIncoming = user('owned-incoming', 'child incoming', 3);
+    const foreignIncoming = { ...user('foreign-incoming', 'parent incoming', 4), threadId: 'parent' };
+
+    expect(reconcileMessages(
+      [foreignCurrent, ownedCurrent],
+      [ownedIncoming, foreignIncoming],
+      'append',
+      'thread',
+    ).map((message) => message.id)).toEqual(['owned-current', 'owned-incoming']);
+
+    expect(reconcileThreadSnapshot(
+      [foreignCurrent, ownedCurrent],
+      [ownedIncoming, foreignIncoming],
+      'thread',
+    ).map((message) => message.id)).toEqual(['owned-current', 'owned-incoming']);
+  });
+
+  it('reconciles hundreds of covered turns without changing canonical turn order', () => {
+    const current: RemoteMessage[] = [];
+    const incoming: RemoteMessage[] = [];
+    for (let index = 0; index < 500; index += 1) {
+      const turnId = `turn-${index}`;
+      current.push({ ...user(`live-${index}`, `live ${index}`, index), role: 'tool', turnId });
+      incoming.push({ ...user(`canonical-${index}`, `canonical ${index}`, index), role: 'assistant', turnId });
+    }
+    const result = reconcileThreadSnapshot(current, incoming, 'thread');
+    expect(result).toHaveLength(1_000);
+    expect(result.slice(0, 4).map((message) => message.id)).toEqual([
+      'canonical-0', 'live-0', 'canonical-1', 'live-1',
+    ]);
+    expect(result.slice(-4).map((message) => message.id)).toEqual([
+      'canonical-498', 'live-498', 'canonical-499', 'live-499',
+    ]);
+  });
+
   it('maps Desktop notLoaded to an explicit non-idle state', () => {
     expect(stateFromStatus({ type: 'notLoaded' })).toBe('not_loaded');
     expect(stateFromStatus({ type: 'active', activeFlags: ['waitingOnApproval'] })).toBe('waiting_approval');
@@ -356,6 +410,39 @@ describe('Desktop canonical item parsing', () => {
       turns: [{ id: 'turn', status: 'inProgress', items: [{ type: 'reasoning', id: 'reason', summary: ['正在核查协议'] }] }],
     } });
     expect(normalized.messages[0]).toMatchObject({ id: 'reason', itemType: 'reasoning', status: 'streaming', content: '正在核查协议' });
+  });
+});
+
+
+describe('Thread ownership isolation', () => {
+  it('drops parent turns and items while inheriting the outer child id only when owner is absent', () => {
+    const normalized = normalizeThreadPayload({ thread: {
+      id: 'child',
+      turns: [
+        {
+          id: 'inherited-turn',
+          items: [
+            { type: 'userMessage', id: 'inherited-item', content: [{ type: 'text', text: 'inherit child' }] },
+            { type: 'agentMessage', id: 'explicit-child-item', ownerConversationId: 'child', text: 'explicit child' },
+            { type: 'agentMessage', id: 'parent-item-thread', threadId: 'parent', text: 'wrong parent' },
+            { type: 'agentMessage', id: 'parent-item-conversation', conversationId: 'parent', text: 'wrong parent' },
+            { type: 'agentMessage', id: 'parent-item-owner-thread', ownerThreadId: 'parent', text: 'wrong parent' },
+            { type: 'agentMessage', id: 'parent-item-owner-conversation', ownerConversationId: 'parent', text: 'wrong parent' },
+          ],
+        },
+        { id: 'parent-turn-thread', threadId: 'parent', items: [{ type: 'agentMessage', id: 'parent-turn-item-1', text: 'wrong parent' }] },
+        { id: 'parent-turn-conversation', conversationId: 'parent', items: [{ type: 'agentMessage', id: 'parent-turn-item-2', text: 'wrong parent' }] },
+        { id: 'parent-turn-owner-thread', ownerThreadId: 'parent', items: [{ type: 'agentMessage', id: 'parent-turn-item-3', text: 'wrong parent' }] },
+        { id: 'parent-turn-owner-conversation', ownerConversationId: 'parent', items: [{ type: 'agentMessage', id: 'parent-turn-item-4', text: 'wrong parent' }] },
+        { id: 'explicit-child-turn', conversationId: 'child', items: [{ type: 'agentMessage', id: 'explicit-child-turn-item', text: 'child turn' }] },
+      ],
+    } });
+
+    expect(normalized.messages.map((message) => [message.id, message.threadId])).toEqual([
+      ['inherited-item', 'child'],
+      ['explicit-child-item', 'child'],
+      ['explicit-child-turn-item', 'child'],
+    ]);
   });
 });
 

@@ -98,6 +98,12 @@ public class CodexBackgroundPlugin extends Plugin {
         if (!requireNotifications(call)) {
             return;
         }
+        if (!CodexBackgroundService.isMarkedRunning(getContext())) {
+            JSObject result = new JSObject();
+            result.put("running", false);
+            call.resolve(result);
+            return;
+        }
         try {
             CodexBackgroundService.update(
                     getContext(),

@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { threadStateLabel } from '../hooks/useRemote';
 import type { ConnectionPhase, RemoteThread } from '../types/protocol';
 import { ConnectionStatus } from './ConnectionStatus';
+import { ElapsedTime } from './ElapsedTime';
 import { PlusIcon, SettingsIcon } from './Icons';
 
 export const PROJECT_COLLAPSE_STORAGE_KEY = 'codex-mobile.project-collapse.v1';
@@ -136,7 +137,6 @@ function ThreadRow({
   thread,
   childrenByParent,
   depth,
-  now,
   onSelect,
   expandedParents,
   onToggleChildren,
@@ -144,7 +144,6 @@ function ThreadRow({
   thread: RemoteThread;
   childrenByParent: Map<string, RemoteThread[]>;
   depth: number;
-  now: number;
   onSelect: (threadId: string) => void;
   expandedParents: Set<string>;
   onToggleChildren: (threadId: string) => void;
@@ -152,17 +151,18 @@ function ThreadRow({
   const children = childrenByParent.get(thread.id) ?? [];
   const isAgent = Boolean(thread.parentThreadId || thread.agentNickname || thread.agentRole);
   const childrenCollapsed = !expandedParents.has(thread.id);
-  const elapsed = thread.state === 'running' && thread.currentTurnStartedAt
-    ? formatDuration(now - thread.currentTurnStartedAt)
-    : thread.lastTurnDurationMs != null
-      ? formatDuration(thread.lastTurnDurationMs)
-      : '';
+  const completedDuration = thread.lastTurnDurationMs != null
+    ? formatDuration(thread.lastTurnDurationMs)
+    : '';
+  const rowStyle = {
+    '--thread-indent': `${Math.min(depth, 4) * 14}px`,
+  } as React.CSSProperties;
 
   return (
     <>
       <button
         className={`thread-card ${isAgent ? 'thread-card-agent' : ''}`}
-        style={{ '--thread-depth': depth } as React.CSSProperties}
+        style={rowStyle}
         type="button"
         onClick={() => onSelect(thread.id)}
       >
@@ -170,7 +170,9 @@ function ThreadRow({
         <span className="thread-main">
           <span className="thread-title-row">
             <strong>{isAgent ? thread.agentNickname || thread.title || 'Subagent' : thread.title || '未命名任务'}</strong>
-            <time>{thread.state === 'running' && elapsed ? elapsed : relativeTime(thread.updatedAt)}</time>
+            <span className="thread-time">{thread.state === 'running' && thread.currentTurnStartedAt
+              ? <ElapsedTime startedAt={thread.currentTurnStartedAt} />
+              : relativeTime(thread.updatedAt)}</span>
           </span>
           {isAgent && (
             <span className="agent-meta">
@@ -181,7 +183,7 @@ function ThreadRow({
           <span className="thread-preview">{thread.preview || (thread.state === 'running' ? '正在执行…' : '等待新消息')}</span>
           <span className="thread-meta">
             {thread.state !== 'idle' && <span className={`state-label state-label-${thread.state}`}>{threadStateLabel(thread.state)}</span>}
-            {elapsed && thread.state !== 'running' && <span className="duration-label">用时 {elapsed}</span>}
+            {completedDuration && thread.state !== 'running' && <span className="duration-label">用时 {completedDuration}</span>}
             {thread.tokenUsage && <span className="token-label">{thread.tokenUsage.totalTokens.toLocaleString()} tokens</span>}
             {children.length > 0 && <span className="agent-count">{children.length} 个 Subagent</span>}
           </span>
@@ -191,6 +193,7 @@ function ThreadRow({
       {children.length > 0 && (
         <button
           className="subagent-toggle"
+          style={rowStyle}
           type="button"
           onClick={() => onToggleChildren(thread.id)}
           aria-expanded={!childrenCollapsed}
@@ -205,7 +208,6 @@ function ThreadRow({
           thread={child}
           childrenByParent={childrenByParent}
           depth={depth + 1}
-          now={now}
           onSelect={onSelect}
           expandedParents={expandedParents}
           onToggleChildren={onToggleChildren}
@@ -216,16 +218,10 @@ function ThreadRow({
 }
 
 export function ThreadList({ threads, phase, phaseDetail, onSelect, onCreate, onSettings, onReconnect }: ThreadListProps) {
-  const [now, setNow] = useState(Date.now());
   const [expandedParents, setExpandedParents] = useState<Set<string>>(new Set());
   const [projectCollapsePreferences, setProjectCollapsePreferences] = useState<ProjectCollapsePreferences>(
     () => readProjectCollapsePreferences(),
   );
-  useEffect(() => {
-    const timer = window.setInterval(() => setNow(Date.now()), 1000);
-    return () => window.clearInterval(timer);
-  }, []);
-
   useEffect(() => {
     writeProjectCollapsePreferences(projectCollapsePreferences);
   }, [projectCollapsePreferences]);
@@ -316,7 +312,7 @@ export function ThreadList({ threads, phase, phaseDetail, onSelect, onCreate, on
               {!collapsed && (
                 <div className="project-threads">
                   {roots.map((thread) => (
-                    <ThreadRow key={thread.id} thread={thread} childrenByParent={childrenByParent} depth={0} now={now} onSelect={onSelect} expandedParents={expandedParents} onToggleChildren={toggleChildren} />
+                    <ThreadRow key={thread.id} thread={thread} childrenByParent={childrenByParent} depth={0} onSelect={onSelect} expandedParents={expandedParents} onToggleChildren={toggleChildren} />
                   ))}
                 </div>
               )}

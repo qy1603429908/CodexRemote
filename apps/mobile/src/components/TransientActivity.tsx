@@ -1,7 +1,9 @@
+import { ElapsedTime } from './ElapsedTime';
+
 interface TransientActivityProps {
   running: boolean;
   content?: string;
-  elapsed?: string;
+  startedAt?: number;
 }
 
 function compact(content: string): string {
@@ -13,7 +15,7 @@ function compact(content: string): string {
     .trim();
 }
 
-export function TransientActivity({ running, content = '', elapsed = '' }: TransientActivityProps) {
+export function TransientActivity({ running, content = '', startedAt }: TransientActivityProps) {
   const summary = compact(content);
   return (
     <div className={`activity-status-slot ${running ? 'is-active' : ''}`} aria-live="polite" aria-atomic="true">
@@ -21,7 +23,7 @@ export function TransientActivity({ running, content = '', elapsed = '' }: Trans
         <div className="activity-status">
           <span className="activity-wave" aria-hidden="true"><i /><i /><i /><i /></span>
           <span className="activity-copy">{summary ? `思考梗概 · ${summary}` : 'Codex 正在思考'}</span>
-          {elapsed && <time>{elapsed}</time>}
+          <ElapsedTime startedAt={startedAt} />
         </div>
       )}
     </div>

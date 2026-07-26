@@ -77,13 +77,24 @@ describe('Consecutive tool grouping', () => {
   });
 
 
-  it('keeps Subagent calls outside generic tool groups for direct navigation', () => {
+  it('folds Subagent calls with adjacent tools while retaining direct agent targets', () => {
     const agent = message('agent', 'tool');
     agent.itemType = 'collabAgentToolCall';
     agent.toolName = 'Subagent · spawnAgent';
+    agent.detail = {
+      receiverThreadIds: ['child-thread'],
+      agentsStates: { 'child-thread': { nickname: 'Worker', status: 'running' } },
+    };
     const entries = groupConsecutiveToolMessages([message('tool-1', 'tool'), agent, message('tool-2', 'tool')]);
     expect(entries.map((entry) => entry.type === 'message' ? entry.message.id : entry.messages.map((item) => item.id)))
-      .toEqual(['tool-1', 'agent', 'tool-2']);
+      .toEqual([['tool-1', 'agent', 'tool-2']]);
+    expect(entries[0]?.type === 'tool-group' ? entries[0].agentTargets : []).toEqual([
+      { id: 'child-thread', label: 'Worker', state: 'running' },
+    ]);
+    expect(entries[0]?.type === 'tool-group' ? entries[0].agentTargetsByMessage.agent : []).toEqual([
+      { id: 'child-thread', label: 'Worker', state: 'running' },
+    ]);
+    expect(entries[0]?.type === 'tool-group' ? entries[0].agentTargetsByMessage['tool-1'] : []).toEqual([]);
   });
 
   it('keeps a stable group identity while later tool calls join the same run', () => {
