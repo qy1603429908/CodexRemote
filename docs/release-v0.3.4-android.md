@@ -2,7 +2,7 @@
 
 日期：2026-07-26
 
-> 状态：APK 已完成本地自动化构建与校验，等待 Git 提交和 Gitea Release 上传；Redmi K80 真机项目仍未证明。
+> 状态：源码、标签和 APK 已发布；Redmi K80 真机项目仍未证明。
 
 ## 范围与交付顺序
 
@@ -84,9 +84,9 @@
 
 - 版本：`0.3.4`
 - `versionCode`：`8`
-- Git 提交：待提交后填写
+- Git 提交：`df80607`
 - APK：`apps/mobile/artifacts/codex-mobile-remote-v0.3.4-debug.apk`
 - APK 大小：约 `5.1 MiB`
 - 签名：Android debug certificate，APK Signature Scheme v2 验证通过
 - SHA-256：`35fa41287948ecff5f647001e08d0f76d3c99bdce615451cc2eedf203f0ca205`
-- Gitea Release：待上传后填写
+- Gitea Release：`https://git.qinmouren.cn/QinYuAdmin/CodexRemote/releases/tag/v0.3.4`
