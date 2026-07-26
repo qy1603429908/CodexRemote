@@ -1,15 +1,22 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { AppServerBridge } from "./app-server-bridge.js";
 import { authenticateBearer } from "./auth.js";
-import { loadConfig } from "./config.js";
+import { buildCodexEnvironment, loadConfig } from "./config.js";
 import { DesktopIpcBridge } from "./desktop-ipc-bridge.js";
 import { FileTransferError, FileTransferManager } from "./file-transfer.js";
 import { MobileGateway } from "./gateway.js";
 import { PromptQueueStore } from "./prompt-queue.js";
 
 const config = loadConfig();
-const bridge = new AppServerBridge({ codexBin: config.codexBin });
-const desktopIpc = new DesktopIpcBridge(config.desktopIpc);
+const bridge = new AppServerBridge({
+  codexBin: config.codexBin,
+  env: buildCodexEnvironment(config.codexHome),
+  expectedCodexHome: config.codexHome,
+});
+const desktopIpc = new DesktopIpcBridge(
+  config.desktopIpc,
+  config.desktopIpcEndpoint,
+);
 const promptQueue = await PromptQueueStore.create(config.promptQueueFile);
 const files = await FileTransferManager.create({ allowedRoots: config.fileRoots, uploadDirectory: config.uploadDirectory });
 await files.cleanupOrphanedUploads(promptQueue.protectedFilePaths());
@@ -26,7 +33,14 @@ async function handleHttp(request: IncomingMessage, response: ServerResponse): P
       "content-type": "application/json; charset=utf-8",
       "cache-control": "no-store",
     });
-    response.end(JSON.stringify({ ok: bridge.ready, service: "codex-mobile-remote", version: "0.3.2", desktopIpc: desktopIpc.ready }));
+    response.end(JSON.stringify({
+      ok: bridge.ready,
+      service: "codex-mobile-remote",
+      version: "0.3.2",
+      desktopIpc: desktopIpc.ready,
+      desktopIpcSupported: desktopIpc.supported,
+      desktopIpcReady: desktopIpc.ready,
+    }));
     return;
   }
 
@@ -144,6 +158,7 @@ process.on("unhandledRejection", (error) => {
   console.error("[server] unhandled rejection", error);
 });
 
+console.log(`[server] Codex home ${config.codexHome}`);
 await bridge.start();
 await desktopIpc.start();
 server.listen(config.port, config.host, () => {

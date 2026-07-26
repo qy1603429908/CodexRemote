@@ -11,6 +11,7 @@ const config: ServerConfig = {
   tokenDigest: createHash("sha256").update(token).digest(),
   allowedOrigins: new Set(["capacitor://localhost"]),
   codexBin: "codex",
+  codexHome: "/tmp/.codex",
   serverId: "test",
 };
 

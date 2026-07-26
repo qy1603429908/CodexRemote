@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -42,7 +42,7 @@ describe("Git diff snapshots", () => {
     const workspace = await mkdtemp(join(tmpdir(), "cmr-workspace-"));
     directories.push(workspace);
     const repository = join(workspace, "project");
-    await exec("mkdir", ["-p", repository]);
+    await mkdir(repository, { recursive: true });
     await git(repository, "init", "-q");
     await writeFile(join(repository, "new.md"), "hello\n");
     await expect(readGitDiff("thread-2", workspace)).rejects.toMatchObject({ code: "not_git_repository" });
@@ -53,7 +53,7 @@ describe("Git diff snapshots", () => {
     directories.push(repository);
     await git(repository, "init", "-q");
     const nested = join(repository, "packages", "mobile");
-    await exec("mkdir", ["-p", nested]);
+    await mkdir(nested, { recursive: true });
     await writeFile(join(nested, "new.md"), "hello\n");
     const snapshot = await readGitDiff("thread-3", nested);
     expect(snapshot.repositoryRoot).toBe(await realpath(repository));

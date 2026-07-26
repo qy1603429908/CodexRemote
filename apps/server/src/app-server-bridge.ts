@@ -1,6 +1,7 @@
 import { EventEmitter } from "node:events";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createInterface } from "node:readline";
+import { posix, win32 } from "node:path";
 
 interface JsonRpcResponse {
   id: number | string;
@@ -27,6 +28,7 @@ export interface AppServerBridgeOptions {
   requestTimeoutMs?: number;
   restartDelayMs?: number;
   env?: NodeJS.ProcessEnv;
+  expectedCodexHome?: string;
 }
 
 export class AppServerBridge extends EventEmitter {
@@ -84,10 +86,18 @@ export class AppServerBridge extends EventEmitter {
     });
 
     try {
-      await this.request("initialize", {
+      const initializeResult = await this.request("initialize", {
         clientInfo: { name: "codex-mobile-remote", title: "Codex Mobile Remote", version: "0.3.2" },
         capabilities: { experimentalApi: true, requestAttestation: false },
       });
+      if (this.options.expectedCodexHome) {
+        const actualCodexHome = record(initializeResult)?.codexHome;
+        if (!codexHomeMatches(this.options.expectedCodexHome, actualCodexHome)) {
+          throw new Error(
+            `codex app-server used unexpected CODEX_HOME; expected ${JSON.stringify(this.options.expectedCodexHome)}, got ${JSON.stringify(actualCodexHome)}`,
+          );
+        }
+      }
       this.notify("initialized");
       this.initialized = true;
       this.emit("ready");
@@ -196,4 +206,30 @@ export class AppServerBridge extends EventEmitter {
     }
     this.pending.clear();
   }
+}
+function record(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+export function codexHomeMatches(expected: string, actual: unknown): boolean {
+  if (typeof actual !== "string" || !actual.trim()) return false;
+  const windowsPath = looksLikeWindowsAbsolutePath(expected) || looksLikeWindowsAbsolutePath(actual);
+  if (windowsPath) {
+    return trimTrailingSeparators(win32.normalize(expected), win32.parse(expected).root.length).toLowerCase()
+      === trimTrailingSeparators(win32.normalize(actual), win32.parse(actual).root.length).toLowerCase();
+  }
+  return trimTrailingSeparators(posix.normalize(expected), posix.parse(expected).root.length)
+    === trimTrailingSeparators(posix.normalize(actual), posix.parse(actual).root.length);
+}
+
+function looksLikeWindowsAbsolutePath(value: string): boolean {
+  return /^[A-Za-z]:[\\/]/.test(value) || /^\\\\/.test(value);
+}
+
+function trimTrailingSeparators(value: string, rootLength: number): string {
+  let result = value;
+  while (result.length > rootLength && /[\\/]$/.test(result)) result = result.slice(0, -1);
+  return result;
 }

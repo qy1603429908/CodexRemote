@@ -9,8 +9,10 @@ export interface ServerConfig {
   tokenDigest: Buffer;
   allowedOrigins: Set<string>;
   codexBin: string;
+  codexHome: string;
   serverId: string;
   desktopIpc: boolean;
+  desktopIpcEndpoint?: string;
   fileRoots: string[];
   uploadDirectory: string;
   promptQueueFile: string;
@@ -56,10 +58,18 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     tokenDigest: createHash("sha256").update(token).digest(),
     allowedOrigins: new Set([...defaultOrigins, ...configuredOrigins]),
     codexBin: env.CODEX_BIN ?? "codex",
+    codexHome: env.CODEX_HOME?.trim() || join(homedir(), ".codex"),
     serverId: env.CMR_SERVER_ID ?? `${hostname()}-${randomUUID().slice(0, 8)}`,
     desktopIpc: env.CMR_DESKTOP_IPC !== "0",
+    desktopIpcEndpoint: env.CMR_DESKTOP_IPC_ENDPOINT?.trim() || undefined,
     fileRoots,
     uploadDirectory,
     promptQueueFile: env.CMR_PROMPT_QUEUE_FILE ?? join(stateDirectory, "prompt-queue.json"),
   };
+}
+export function buildCodexEnvironment(
+  codexHome: string,
+  env: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  return { ...env, CODEX_HOME: codexHome };
 }

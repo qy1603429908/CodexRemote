@@ -1,4 +1,5 @@
 import type { IncomingMessage } from "node:http";
+import { isAbsolute } from "node:path";
 import type { Duplex } from "node:stream";
 import { WebSocket, WebSocketServer } from "ws";
 import {
@@ -16,6 +17,7 @@ import type { ServerConfig } from "./config.js";
 import { AppServerBridge } from "./app-server-bridge.js";
 import {
   DesktopIpcBridge,
+  activeConversationTurnId,
   canonicalTurns,
   conversationIsActive,
   isExplicitInactiveSteerError,
@@ -25,6 +27,8 @@ import type { FileTransferManager } from "./file-transfer.js";
 import { GitDiffError, readGitDiff, type GitDiffSnapshot } from "./git-diff.js";
 import { PromptQueueStore, type StoredPromptQueueItem } from "./prompt-queue.js";
 import { SyncJournal, ThreadIndexStore } from "./sync-state.js";
+
+const MAX_WS_BUFFERED_BYTES = 8 * 1024 * 1024;
 
 interface RpcEnvelope {
   id: number | string;
@@ -69,6 +73,8 @@ class GatewayRequestError extends Error {
 
 const TURN_SUBMISSION_TTL_MS = 10 * 60_000;
 const MAX_TURN_SUBMISSIONS = 1_000;
+const EMPTY_THREAD_INDEX_TTL_MS = 5_000;
+const THREAD_INDEX_TTL_MS = 60_000;
 const THREAD_SOURCE_KINDS = [
   "cli", "vscode", "exec", "appServer", "subAgent", "subAgentReview",
   "subAgentCompact", "subAgentThreadSpawn", "subAgentOther", "unknown",
@@ -95,6 +101,7 @@ export class MobileGateway {
   private readonly threadIndex = new ThreadIndexStore();
   private readonly socketThreads = new WeakMap<WebSocket, Set<string>>();
   private threadIndexLoad: Promise<void> | null = null;
+  private threadIndexLoadedAt = 0;
 
   constructor(
     private readonly bridge: AppServerBridge,
@@ -108,17 +115,19 @@ export class MobileGateway {
       handleProtocols: selectedProtocol,
     });
     this.wss.on("connection", (socket) => this.onConnection(socket));
-    bridge.on("ready", () =>
-      this.broadcast({ type: "status", codexReady: true }),
-    );
+    bridge.on("ready", () => {
+      this.threadIndexLoadedAt = 0;
+      this.broadcast({ type: "status", codexReady: true });
+    });
     bridge.on("offline", (error: Error) => {
-      for (const requestId of this.approvals.keys()) {
+      for (const [requestId, approval] of this.approvals) {
+        if (approval.params?._desktopOrigin === true) continue;
+        this.approvals.delete(requestId);
         this.broadcast({
           type: "approval.resolved",
           approvalRequestId: requestId,
         });
       }
-      this.approvals.clear();
       this.turnDiffs.clear();
       this.appServerThreadStatuses.clear();
       this.appServerCurrentTurnIds.clear();
@@ -225,7 +234,7 @@ export class MobileGateway {
         }
         if (wasDesktopActive && !this.isThreadActive(id)) void this.refreshThreadDiff(id, true);
       }
-      if (typeof thread.cwd === "string" && thread.cwd.startsWith("/")) this.threadCwds.set(id, thread.cwd);
+      if (typeof thread.cwd === "string" && isAbsoluteHostPath(thread.cwd)) this.threadCwds.set(id, thread.cwd);
       this.upsertThreadSummary({ ...toThreadSummary(thread), status: this.mergedThreadStatus(id, thread.threadRuntimeStatus ?? thread.status) });
       this.syncDesktopApprovals(id, thread);
       const liveThread = projectDesktopLiveThread(this.projectThreadRuntimeStatus(thread));
@@ -243,21 +252,125 @@ export class MobileGateway {
       this.desktopQueuedFollowUps.set(event.conversationId, event.messages.length);
       if (event.messages.length === 0) this.scheduleQueueDrain(event.conversationId);
     });
-    desktopIpc?.on("offline", () => {
-      this.desktopThreads.clear();
-      this.desktopQueuedFollowUps.clear();
-      for (const wireId of [...this.desktopApprovalKeys]) {
-        this.desktopApprovalKeys.delete(wireId);
-        if (this.approvals.delete(wireId))
-          this.broadcast({
-            type: "approval.resolved",
-            approvalRequestId: wireId,
-          });
-      }
+    desktopIpc?.on("ready", () => {
+      for (const socket of this.wss.clients)
+        for (const threadId of this.socketThreads.get(socket) ?? [])
+          void this.restoreDesktopSubscription(socket, threadId);
+    });
+    desktopIpc?.on("offline", () => this.clearDesktopState());
+    desktopIpc?.on("reset", () => this.clearDesktopState());
+    desktopIpc?.on("ownerLost", (threadId: string) => {
+      this.desktopThreads.delete(threadId);
+      this.desktopQueuedFollowUps.delete(threadId);
+      this.clearDesktopApprovalsForThread(threadId);
+      const change = this.threadIndex.remove(threadId);
+      if (change)
+        this.broadcast({
+          type: "threads.delta",
+          baseVersion: change.version - 1,
+          version: change.version,
+          upserts: [],
+          removedIds: [threadId],
+        });
+      void this.refreshThreadIndexBroadcast().catch((error) =>
+        console.warn("[desktop-ipc] failed to refresh after owner loss", error),
+      );
+    });
+    desktopIpc?.on("threadArchived", (params: Record<string, unknown>) => {
+      const threadId = typeof params.conversationId === "string"
+        ? params.conversationId
+        : typeof params.threadId === "string"
+          ? params.threadId
+          : null;
+      if (!threadId) return;
+      const change = this.threadIndex.remove(threadId);
+      if (change)
+        this.broadcast({
+          type: "threads.delta",
+          baseVersion: change.version - 1,
+          version: change.version,
+          upserts: [],
+          removedIds: [threadId],
+        });
+    });
+    desktopIpc?.on("threadUnarchived", () => {
+      void this.refreshThreadIndexBroadcast().catch((error) =>
+        console.warn("[desktop-ipc] failed to refresh unarchived thread", error),
+      );
     });
     desktopIpc?.on("diagnostic", (error: unknown) =>
       console.warn("[desktop-ipc]", error),
     );
+  }
+
+  private async restoreDesktopSubscription(
+    socket: WebSocket,
+    threadId: string,
+  ): Promise<void> {
+    if (!this.desktopIpc?.ready) return;
+    try {
+      const thread = await this.desktopIpc.openConversation(
+        threadId,
+        "local",
+        2_500,
+        false,
+      );
+      if (!thread || !this.desktopIpc.hasOwner(threadId)) return;
+      this.desktopThreads.set(threadId, thread);
+      const liveThread = projectDesktopLiveThread(
+        this.projectThreadRuntimeStatus(thread),
+      );
+      await this.trustDesktopAttachments(liveThread);
+      if (this.socketThreads.get(socket)?.has(threadId))
+        this.send(socket, {
+          type: "event",
+          method: "desktop/threadSnapshot",
+          params: { thread: liveThread },
+        });
+    } catch (error) {
+      console.warn(`[desktop-ipc] failed to restore ${threadId}`, error);
+    }
+  }
+
+  private clearDesktopApprovalsForThread(threadId: string): void {
+    const prefix = `desktop:${threadId}:`;
+    for (const wireId of [...this.desktopApprovalKeys]) {
+      if (!String(wireId).startsWith(prefix)) continue;
+      this.desktopApprovalKeys.delete(wireId);
+      if (this.approvals.delete(wireId))
+        this.broadcast({
+          type: "approval.resolved",
+          approvalRequestId: wireId,
+        });
+    }
+  }
+
+  private clearDesktopState(): void {
+    for (const threadId of this.desktopThreads.keys())
+      this.threadIndex.remove(threadId);
+    this.desktopThreads.clear();
+    this.desktopQueuedFollowUps.clear();
+    for (const wireId of [...this.desktopApprovalKeys]) {
+      this.desktopApprovalKeys.delete(wireId);
+      if (this.approvals.delete(wireId))
+        this.broadcast({
+          type: "approval.resolved",
+          approvalRequestId: wireId,
+        });
+    }
+    void this.refreshThreadIndexBroadcast().catch((error) =>
+      console.warn("[desktop-ipc] failed to refresh after reset", error),
+    );
+  }
+
+  private async refreshThreadIndexBroadcast(): Promise<void> {
+    this.threadIndexLoadedAt = 0;
+    await this.ensureThreadIndex();
+    this.broadcast({
+      type: "threads.snapshot",
+      version: this.threadIndex.currentVersion,
+      threads: this.threadIndex.snapshot(),
+    });
   }
 
   handleUpgrade(request: IncomingMessage, socket: Duplex, head: Buffer): void {
@@ -396,6 +509,8 @@ export class MobileGateway {
               events: replay.events,
             });
           }
+          for (const threadId of threadIds)
+            void this.restoreDesktopSubscription(socket, threadId);
           break;
         }
         case "threads.sync":
@@ -685,13 +800,19 @@ export class MobileGateway {
         }
         case "turn.interrupt": {
           const threadId = requiredString(message.threadId, "threadId");
-          if (this.desktopIpc?.hasOwner(threadId))
+          const turnId = requiredString(message.turnId, "turnId");
+          if (this.desktopIpc?.hasOwner(threadId)) {
+            const activeTurnId = activeConversationTurnId(
+              this.desktopIpc.getConversation(threadId),
+            );
+            if (!activeTurnId)
+              throw new Error("Desktop task has no active turn to interrupt.");
+            if (activeTurnId !== turnId)
+              throw new Error("The requested turn is no longer the active Desktop turn.");
             await this.desktopIpc.interruptTurn(threadId, "user");
-          else
-            await this.bridge.request("turn/interrupt", {
-              threadId,
-              turnId: requiredString(message.turnId, "turnId"),
-            });
+          } else {
+            await this.bridge.request("turn/interrupt", { threadId, turnId });
+          }
           break;
         }
         case "approval.resolve":
@@ -994,7 +1115,12 @@ export class MobileGateway {
   }
 
   private async ensureThreadIndex(): Promise<void> {
-    if (this.threadIndex.isInitialized) return;
+    if (this.threadIndex.isInitialized) {
+      const ttl = this.threadIndex.snapshot().length === 0
+        ? EMPTY_THREAD_INDEX_TTL_MS
+        : THREAD_INDEX_TTL_MS;
+      if (Date.now() - this.threadIndexLoadedAt < ttl) return;
+    }
     if (this.threadIndexLoad) return this.threadIndexLoad;
     this.threadIndexLoad = (async () => {
       const data: Array<Record<string, unknown>> = [];
@@ -1023,8 +1149,9 @@ export class MobileGateway {
         ...thread,
         status: this.mergedThreadStatus(thread.id, thread.status),
       })));
+      this.threadIndexLoadedAt = Date.now();
       for (const thread of this.threadIndex.snapshot()) {
-        if (thread.cwd.startsWith("/")) this.threadCwds.set(thread.id, thread.cwd);
+        if (isAbsoluteHostPath(thread.cwd)) this.threadCwds.set(thread.id, thread.cwd);
       }
     })().finally(() => {
       this.threadIndexLoad = null;
@@ -1073,7 +1200,7 @@ export class MobileGateway {
 
   private upsertThreadSummary(summary: ThreadSummary): void {
     if (!summary.id) return;
-    if (summary.cwd.startsWith("/")) this.threadCwds.set(summary.id, summary.cwd);
+    if (isAbsoluteHostPath(summary.cwd)) this.threadCwds.set(summary.id, summary.cwd);
     const change = this.threadIndex.upsert(summary);
     if (!change) return;
     this.broadcast({
@@ -1118,7 +1245,9 @@ export class MobileGateway {
     knownTurnIds?: string[],
   ): Promise<void> {
     const limit = boundedHistoryLimit(requestedLimit);
-    const desktopThread = await this.desktopIpc?.openConversation(threadId, "local", 2_500, false);
+    const desktopThread = this.desktopIpc?.ready
+      ? await this.desktopIpc.openConversation(threadId, "local", 2_500, false)
+      : null;
     let metadataPayload: unknown;
     if (desktopThread && this.desktopIpc?.hasOwner(threadId)) {
       this.desktopThreads.set(threadId, desktopThread);
@@ -1204,7 +1333,7 @@ export class MobileGateway {
   private rememberThreadCwd(threadId: string, payload: unknown): void {
     const outer = asRecord(payload);
     const thread = asRecord(outer?.thread) ?? outer;
-    if (typeof thread?.cwd === "string" && thread.cwd.startsWith("/"))
+    if (typeof thread?.cwd === "string" && isAbsoluteHostPath(thread.cwd))
       this.threadCwds.set(threadId, thread.cwd);
   }
 
@@ -1219,7 +1348,7 @@ export class MobileGateway {
       typeof desktopCwd === "string"
         ? desktopCwd
         : this.threadCwds.get(threadId);
-    if (!cwd || !cwd.startsWith("/"))
+    if (!cwd || !isAbsoluteHostPath(cwd))
       throw new Error(
         "Task working directory is unavailable; refusing to widen workspace permissions.",
       );
@@ -1334,23 +1463,41 @@ export class MobileGateway {
   private broadcast(message: ServerMessage): void {
     const synced = this.syncJournal.append(message);
     const payload = JSON.stringify(synced);
-    for (const socket of this.wss.clients) {
-      if (socket.readyState === WebSocket.OPEN) socket.send(payload);
-    }
+    for (const socket of this.wss.clients)
+      this.sendPayload(socket, payload);
   }
 
   private broadcastThread(threadId: string, message: ServerMessage): void {
+    const sockets = [...this.wss.clients].filter(
+      (socket) =>
+        socket.readyState === WebSocket.OPEN &&
+        this.socketThreads.get(socket)?.has(threadId),
+    );
+    const isDesktopSnapshot =
+      message.type === "event" &&
+      message.method === "desktop/threadSnapshot";
+    if (isDesktopSnapshot) {
+      if (sockets.length === 0) return;
+      const payload = JSON.stringify(message);
+      for (const socket of sockets) this.sendPayload(socket, payload);
+      return;
+    }
     const synced = this.syncJournal.append(message, threadId);
     const payload = JSON.stringify(synced);
-    for (const socket of this.wss.clients) {
-      if (socket.readyState !== WebSocket.OPEN) continue;
-      if (this.socketThreads.get(socket)?.has(threadId)) socket.send(payload);
-    }
+    for (const socket of sockets) this.sendPayload(socket, payload);
   }
 
   private send(socket: WebSocket, message: ServerMessage): void {
-    if (socket.readyState === WebSocket.OPEN)
-      socket.send(JSON.stringify(message));
+    this.sendPayload(socket, JSON.stringify(message));
+  }
+
+  private sendPayload(socket: WebSocket, payload: string): void {
+    if (socket.readyState !== WebSocket.OPEN) return;
+    if (socket.bufferedAmount > MAX_WS_BUFFERED_BYTES) {
+      socket.terminate();
+      return;
+    }
+    socket.send(payload);
   }
 
   private rejectUpgrade(socket: Duplex, status: number, reason: string): void {
@@ -1384,7 +1531,7 @@ export class MobileGateway {
 export function desktopAttachmentPaths(thread: Record<string, unknown>): string[] {
   const paths = new Set<string>();
   const add = (value: unknown) => {
-    if (typeof value === "string" && value.startsWith("/")) paths.add(value);
+    if (typeof value === "string" && isAbsoluteHostPath(value)) paths.add(value);
   };
   for (const turnValue of canonicalTurns(thread)) {
     const turn = asRecord(turnValue);
@@ -1559,9 +1706,13 @@ function requiredString(value: unknown, name: string): string {
   return value;
 }
 
+export function isAbsoluteHostPath(value: string): boolean {
+  return isAbsolute(value);
+}
+
 function requiredAbsolutePath(value: unknown, name: string): string {
   const text = requiredString(value, name);
-  if (!text.startsWith("/"))
+  if (!isAbsoluteHostPath(text))
     throw new Error(`${name} must be an absolute path.`);
   return text;
 }
@@ -1790,7 +1941,7 @@ function permissionSettings(
       approvalsReviewer: "user",
       sandboxPolicy: { type: "readOnly", networkAccess: false },
     };
-  if (!cwd || !cwd.startsWith("/"))
+  if (!cwd || !isAbsoluteHostPath(cwd))
     throw new Error(
       "A verified task working directory is required for workspace permissions.",
     );

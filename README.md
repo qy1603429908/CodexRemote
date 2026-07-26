@@ -76,6 +76,16 @@ npm run host:start
 curl http://127.0.0.1:8787/health
 ```
 
+### Windows Host
+
+Set the real Codex data directory explicitly so the Codex Desktop bundled CLI does not fall back to an isolated sandbox home and return an empty task list:
+
+```dotenv
+CODEX_HOME=C:\Users\<username>\.codex
+```
+
+The Server passes this value to `codex app-server` and verifies the `codexHome` returned by `initialize`. A mismatch fails startup instead of silently serving an empty history. On Windows, the Server also follows the Codex Desktop owner through the local named pipe `\\.\pipe\codex-ipc`, applies revisioned live patches in memory, and forwards canonical task snapshots over `/ws`. Set `CMR_DESKTOP_IPC=0` only when this private integration must be disabled.
+
 ### 连接方式
 
 - **Tailscale Serve / HTTPS**：保持 `CMR_HOST=127.0.0.1`，把 TLS 入口反向代理到 `127.0.0.1:8787`；
