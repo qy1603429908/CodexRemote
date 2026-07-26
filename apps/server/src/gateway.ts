@@ -181,6 +181,7 @@ export class MobileGateway {
           typeof params?.threadId === "string"
         ) {
           const turn = asRecord(params.turn);
+          this.clearAppServerApprovals(params.threadId);
           if (typeof turn?.id === "string") this.turnDiffs.delete(turnKey(params.threadId, turn.id));
           this.rememberAppServerCompletedTurn(params.threadId, turn);
           const completedStatus = String(turn?.status ?? params.status ?? "").toLowerCase();
@@ -190,6 +191,22 @@ export class MobileGateway {
             this.scheduleQueueDrain(params.threadId);
           }
           void this.refreshThreadDiff(params.threadId, true);
+        }
+        if (
+          (message.method === "item/completed" ||
+            message.method === "item/commandExecution/completed" ||
+            message.method === "item/fileChange/completed") &&
+          typeof params?.threadId === "string"
+        ) {
+          const item = asRecord(params.item);
+          const itemId =
+            typeof params.itemId === "string"
+              ? params.itemId
+              : typeof item?.id === "string"
+                ? item.id
+                : undefined;
+          const turnId = typeof params.turnId === "string" ? params.turnId : undefined;
+          this.clearAppServerApprovals(params.threadId, { turnId, itemId });
         }
         if (
           message.method === "serverRequest/resolved" &&
@@ -431,17 +448,24 @@ export class MobileGateway {
       latestCursor: this.syncJournal.latestCursor,
       threadIndexVersion: this.threadIndex.currentVersion,
     });
+    const pendingApprovals: ApprovalRequest[] = [];
     for (const approval of this.approvals.values()) {
       const params = approval.params ?? {};
       const diff =
         typeof params.threadId === "string" && typeof params.turnId === "string"
           ? this.turnDiffs.get(turnKey(params.threadId, params.turnId))
           : undefined;
+      const normalized = normalizeApproval(approval, diff);
+      pendingApprovals.push(normalized);
       this.send(socket, {
         type: "approval",
-        approval: normalizeApproval(approval, diff),
+        approval: normalized,
       });
     }
+    // This is the authoritative reconciliation boundary for reconnects. Individual
+    // approval messages stay for backwards compatibility; the snapshot lets new
+    // clients remove approvals whose resolved event was missed while offline.
+    this.send(socket, { type: "approvals.snapshot", approvals: pendingApprovals });
     // Large task indexes and histories are client-requested after welcome so a
     // reconnect can resume from its persisted cursor without a duplicate dump.
   }
@@ -789,6 +813,7 @@ export class MobileGateway {
             break;
           }
           const result = await this.submitPreparedTurn(threadId, turnParams, deliveryMode);
+          await Promise.all(queuedUploadIds.map((uploadId) => this.files?.commitUpload(uploadId)));
           const turnResult = asRecord(result);
           this.send(socket, {
             type: "turn.started",
@@ -1012,7 +1037,7 @@ export class MobileGateway {
           ? await this.submitPreparedTurn(item.threadId, item.turnParams, "steer")
           : await this.startQueuedTurn(item.threadId, item.turnParams);
       await this.promptQueue.complete(item.id);
-      this.releaseQueueUploads(item);
+      await Promise.all(item.uploadIds.map((uploadId) => this.files?.commitUpload(uploadId)));
       this.broadcastQueue(item.threadId);
       return result;
     } catch (error) {
@@ -1415,6 +1440,18 @@ export class MobileGateway {
       );
       return;
     }
+    const requestThreadId =
+      typeof message.params?.threadId === "string" ? message.params.threadId : undefined;
+    const desktopOwnsThread = Boolean(
+      requestThreadId &&
+      this.desktopIpc?.ready &&
+      this.desktopThreads.has(requestThreadId),
+    );
+    // Desktop IPC is authoritative for command/file/permission approvals on a
+    // Desktop-owned task. app-server mirrors can receive the same callback even
+    // when Desktop auto-approves it, which previously produced a phone-only card.
+    // Native MCP elicitation is not exposed by Desktop IPC and must remain routed.
+    if (desktopOwnsThread && message.method !== "mcpServer/elicitation/request") return;
     const wasPending = this.approvals.has(message.id);
     this.approvals.set(message.id, message);
     if (wasPending) return;
@@ -1427,6 +1464,20 @@ export class MobileGateway {
       type: "approval",
       approval: normalizeApproval(message, diff),
     });
+  }
+
+  private clearAppServerApprovals(
+    threadId: string,
+    match: { turnId?: string; itemId?: string } = {},
+  ): void {
+    for (const [requestId, pending] of [...this.approvals]) {
+      const params = pending.params ?? {};
+      if (params._desktopOrigin === true || params.threadId !== threadId) continue;
+      if (match.turnId && params.turnId !== match.turnId) continue;
+      if (match.itemId && params.itemId !== match.itemId) continue;
+      this.approvals.delete(requestId);
+      this.broadcast({ type: "approval.resolved", approvalRequestId: requestId });
+    }
   }
 
   private async resolveApproval(

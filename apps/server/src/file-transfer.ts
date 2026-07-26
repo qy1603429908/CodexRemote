@@ -10,6 +10,7 @@ const DEFAULT_MAX_DOWNLOAD_BYTES = 256 * 1024 * 1024;
 const DEFAULT_DOWNLOAD_TTL_MS = 10 * 60 * 1000;
 const DEFAULT_UPLOAD_TTL_MS = 60 * 60 * 1000;
 const MAX_FILENAME_BYTES = 180;
+const COMMITTED_UPLOAD_MARKER = ".codex-remote-committed";
 
 export type FileTransferErrorCode =
   | "INVALID_ARGUMENT"
@@ -334,6 +335,17 @@ export class FileTransferManager {
     return true;
   }
 
+  /** Marks an upload as durable because a persisted Codex message now references it. */
+  async commitUpload(uploadId: string): Promise<boolean> {
+    const record = this.uploads.get(uploadId);
+    if (!record) return false;
+    const markerPath = resolve(record.storageDirectory, COMMITTED_UPLOAD_MARKER);
+    const marker = await open(markerPath, "a", 0o600);
+    await marker.close();
+    record.expiresAt = Number.MAX_SAFE_INTEGER;
+    return true;
+  }
+
   async getUpload(uploadId: string): Promise<StoredUpload> {
     const record = this.uploads.get(uploadId);
     if (!record) throw new FileTransferError("TRANSFER_NOT_FOUND", "upload was not found", 404);
@@ -349,7 +361,7 @@ export class FileTransferManager {
   }
 
   /** Trusts one exact file path observed in a Desktop canonical user attachment. */
-  async trustDesktopAttachment(path: string, ttlMs = this.uploadTtlMs): Promise<string> {
+  async trustDesktopAttachment(path: string, ttlMs = Number.MAX_SAFE_INTEGER): Promise<string> {
     assertPositiveInteger(ttlMs, "ttlMs");
     let canonicalPath: string;
     try {
@@ -458,6 +470,12 @@ export class FileTransferManager {
       if (!isWithinRoot(this.uploadDirectory, directory) || protectedPaths.has(directory)) continue;
       const metadata = await lstat(directory);
       if (metadata.isSymbolicLink() || metadata.mtimeMs + this.uploadTtlMs > this.now()) continue;
+      try {
+        const marker = await lstat(resolve(directory, COMMITTED_UPLOAD_MARKER));
+        if (marker.isFile() && !marker.isSymbolicLink()) continue;
+      } catch {
+        // No durable marker: the stale directory remains eligible for cleanup.
+      }
       await rm(directory, { recursive: true, force: true });
       removed += 1;
     }

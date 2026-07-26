@@ -234,3 +234,15 @@
 - [x] 构建并安装 v0.3.7（versionCode 11）到 Redmi Note 14 Pro+；新 Computer Use 审批真机日志仅出现 1 次 approval fallback，前台迟到 notifyApproval 被 notificationId 认领拦截。
 - [x] 记录 APK SHA-256：`807591cf75e5a1c30ee6fb807c4ea659fbe3496f2413642506e9a1d590333fb9`。
 - [x] 完成真机单次铃声复验、Git 审查和 Gitea v0.3.7 Release 发布。
+
+### v0.3.8 审批权威状态、附件持久化与 Subagent 通知归属（2026-07-26）
+
+- [x] 记录现场证据：Desktop-owned 主任务为 `approval_mode=never`、`sandbox_policy=disabled`，GUI 无审批；手机仍展示已经失败/结束的 `item/commandExecution/requestApproval`，服务端当前 pending approval 实际为空。
+- [x] Desktop-owned 任务的命令、文件和权限审批以 Desktop IPC 为权威，抑制 app-server 镜像产生的手机独有审批；原生 `mcpServer/elicitation/request` 继续走手机审批。
+- [x] item/turn 完成时主动清理对应 app-server 审批，不再依赖可能遗漏的 `serverRequest/resolved`。
+- [x] 新增 `approvals.snapshot` 权威快照；重连时客户端必须删除离线期间漏掉 resolved 事件所遗留的审批卡和通知。
+- [x] 手机上传并进入已持久化消息的图片/文件写入 durable marker，禁止一小时 TTL 或服务重启后的 orphan cleanup 删除；Desktop 历史附件信任不再一小时过期。
+- [x] 主任务界面仍展示 Subagent 状态，但 Subagent turn 完成不得发送“Codex 已完成”系统通知，也不得点击通知后跳进子任务。
+- [x] Protocol、Server、Mobile、Android 单测和生产构建全部通过。
+- [x] 构建新版 APK（versionCode 12），SHA-256 已记录在 `docs/release-v0.3.8-android.md`。
+- [ ] 真机复验：无幽灵审批、历史图片持续可见、Subagent 完成无主任务完成通知（当前 `adb devices` 无设备，不能虚报通过）。

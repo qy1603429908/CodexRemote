@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { applyPendingMessageDeltas, canonicalProjectedItems, compactionStatusFromThreadPayload, consumeThreadActivationIntent, contextCompactionItemIdsFromThreadPayload, createSelectedMessagesSelector, dedupeMessages, eventThreadId, isActiveTurnStatus, normalizeThreadPayload, optimisticAttachmentsFromUploads, permissionModeLabel, reconcileMessages, reconcileThreadSnapshot, shouldApplyPermissionModeSnapshot, stateFromStatus, turnIdsAfterSnapshot, visibleUserText } from '../src/hooks/useRemote';
+import { applyPendingMessageDeltas, canonicalProjectedItems, compactionStatusFromThreadPayload, consumeThreadActivationIntent, contextCompactionItemIdsFromThreadPayload, createSelectedMessagesSelector, dedupeMessages, eventThreadId, isActiveTurnStatus, normalizeThreadPayload, optimisticAttachmentsFromUploads, permissionModeLabel, reconcileMessages, reconcileThreadSnapshot, shouldApplyPermissionModeSnapshot, shouldNotifyThreadCompletion, staleApprovalWireIds, stateFromStatus, turnIdsAfterSnapshot, visibleUserText } from '../src/hooks/useRemote';
 import type { RemoteMessage } from '../src/types/protocol';
 
 function user(id: string, content: string, createdAt: number): RemoteMessage {
@@ -22,6 +22,21 @@ describe('Permission mode synchronization', () => {
     expect(permissionModeLabel('read-only')).toBe('严格审阅 · 只读');
     expect(permissionModeLabel('guardian-approvals')).toBe('替我审阅');
     expect(permissionModeLabel('full-access')).toBe('完全访问');
+  });
+});
+
+describe('Authoritative notification reconciliation', () => {
+  it('removes approvals omitted from the reconnect snapshot', () => {
+    expect(staleApprovalWireIds(
+      [{ wireId: 1 }, { wireId: 'desktop:thread:2' }],
+      [{ wireId: 'desktop:thread:2' }],
+    )).toEqual([1]);
+  });
+
+  it('notifies parent task completion but never Subagent completion', () => {
+    expect(shouldNotifyThreadCompletion(undefined)).toBe(true);
+    expect(shouldNotifyThreadCompletion({ parentThreadId: null })).toBe(true);
+    expect(shouldNotifyThreadCompletion({ parentThreadId: 'parent-thread' })).toBe(false);
   });
 });
 

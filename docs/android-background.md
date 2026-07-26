@@ -15,9 +15,9 @@ Android 原生 `CodexBackgroundService` 是用户主动启用的前台服务：
 - 从 Android Keystore 加密存储读取配对令牌；
 - 使用与 WebView 相同的 `codex-mobile-v1` + `token.<base64url>` WebSocket 子协议；
 - 只发送 `threads.list` 应用消息；连接保活使用 OkHttp WebSocket ping frame，不发送提示词、审批决定、任务启动/中断等控制消息；
-- 监听任务完成、显式审批、`waitingOnApproval`、`waitingOnUserInput`、任务列表快照和增量；
+- 监听主任务完成、显式审批、`waitingOnApproval`、`waitingOnUserInput`、任务列表快照和增量；Subagent 完成只更新状态，不发布“任务完成”通知；
 - 显式审批和完成事件与 WebView 使用相同通知 ID；粗粒度等待状态延迟 2 秒并在显式审批到达时取消；WebView 用 generation guard 阻止“取消后异步复活”；
-- WebView 被 HyperOS 冻结时，前台 Service 仍可独立重连并产生本地通知；审批/等待通知的最小索引持久化在本机，Service 进程重建后由首个全量快照做差集清理。
+- WebView 被 HyperOS 冻结时，前台 Service 仍可独立重连并产生本地通知；审批/等待通知的最小索引持久化在本机，Service 进程重建后由 `approvals.snapshot` 和首个任务全量快照做差集清理。
 
 通知渠道：
 

@@ -333,13 +333,15 @@ mobile typecheck: exit 0
 覆盖项：文件名/MIME 清洗、流式上传、大小超限与部分文件清理、根目录与 symlink escape、
 一次性票据、文件替换、TTL、上传清理、上传目录 symlink escape。
 
-## Desktop canonical 附件临时信任
+## 已提交上传的持久化与 Desktop canonical 附件信任
 
-Desktop GUI 的图片通常位于 macOS 临时目录，不属于管理员配置的 `CMR_FILE_ROOTS`。为避免把整个 `/var/folders` 加入下载白名单，Host 只对 Desktop canonical user item 中实际出现的**精确文件 realpath**建立短期信任记录：
+手机上传文件在 turn 成功提交后写入上传目录内的 `.codex-remote-committed` 标记。该标记表示持久化消息已经引用此文件：记录不再受默认一小时上传 TTL 限制，服务重启后的 orphan cleanup 也必须跳过该目录。未成功提交的临时上传仍按 TTL 清理。
+
+Desktop GUI 的图片通常位于 macOS 临时目录，不属于管理员配置的 `CMR_FILE_ROOTS`。为避免把整个 `/var/folders` 加入下载白名单，Host 只对 Desktop canonical user item 中实际出现的**精确文件 realpath**建立信任记录：
 
 - 只扫描 user/steeringUserMessage 的 image/file/mention 输入和附件字段；
 - 不信任工具输出、命令文本或任意 `path` 字段；
 - 注册时验证 regular file、大小上限和 canonical realpath；
 - 下载仍需 bearer 鉴权与一次性 opaque ticket；
 - sibling 文件和目录不会因父目录相同而获得权限；
-- 信任记录按 TTL 清理。
+- canonical 历史消息仍引用的精确文件不再使用一小时 TTL；文件自身被系统或 Desktop 删除后无法由 Remote 恢复。

@@ -55,6 +55,7 @@ final class CodexBackgroundSocket {
     private final Map<String, String> notifiedAttention = new ConcurrentHashMap<>();
     private final Map<String, Runnable> attentionTimers = new ConcurrentHashMap<>();
     private final Map<String, String> threadStates = new ConcurrentHashMap<>();
+    private final Map<String, String> threadParentIds = new ConcurrentHashMap<>();
     private final Map<String, Runnable> completionTimers = new ConcurrentHashMap<>();
     private final Map<String, Long> lastCompletionAt = new ConcurrentHashMap<>();
     private final CodexApprovalTracker approvalTracker = new CodexApprovalTracker();
@@ -295,6 +296,9 @@ final class CodexBackgroundSocket {
             case "approval":
                 handleApproval(message.optJSONObject("approval"));
                 break;
+            case "approvals.snapshot":
+                handleApprovalSnapshot(message.optJSONArray("approvals"));
+                break;
             case "approval.resolved":
                 handleApprovalResolved(String.valueOf(message.opt("approvalRequestId")));
                 break;
@@ -390,6 +394,9 @@ final class CodexBackgroundSocket {
         knownThreadIds.add(threadId);
         String title = firstString(thread, "name", "title", "preview");
         if (!title.isEmpty()) threadTitles.put(threadId, title);
+        String parentThreadId = firstString(thread, "parentThreadId", "parent_thread_id");
+        if (parentThreadId.isEmpty()) threadParentIds.remove(threadId);
+        else threadParentIds.put(threadId, parentThreadId);
         Object rawStatus = thread.opt("threadRuntimeStatus");
         if (rawStatus == null || rawStatus == JSONObject.NULL) rawStatus = thread.opt("status");
         String state = stateFromStatus(rawStatus);
@@ -443,6 +450,23 @@ final class CodexBackgroundSocket {
         }
     }
 
+    private synchronized void handleApprovalSnapshot(JSONArray approvals) {
+        Set<String> activeIds = new HashSet<>();
+        if (approvals != null) {
+            for (int index = 0; index < approvals.length(); index += 1) {
+                JSONObject approval = approvals.optJSONObject(index);
+                if (approval == null) continue;
+                String requestId = String.valueOf(approval.opt("requestId"));
+                if (requestId.isEmpty() || "null".equals(requestId)) continue;
+                activeIds.add(requestId);
+                handleApproval(approval);
+            }
+        }
+        for (String requestId : approvalTracker.requestIds()) {
+            if (!activeIds.contains(requestId)) handleApprovalResolved(requestId);
+        }
+    }
+
     private synchronized void handleApprovalResolved(String requestId) {
         recoveredApprovalEntries.remove(requestId);
         int id = notificationId("approval:" + requestId);
@@ -462,6 +486,10 @@ final class CodexBackgroundSocket {
         cancelCompletionFallback(threadId);
         String status = turn == null ? "completed" : turn.optString("status", "completed").toLowerCase(Locale.ROOT);
         threadStates.put(threadId, status.contains("fail") ? "error" : "idle");
+        if (threadParentIds.containsKey(threadId)) {
+            clearPendingAttention(threadId);
+            return;
+        }
         long now = android.os.SystemClock.elapsedRealtime();
         Long previousCompletion = lastCompletionAt.get(threadId);
         if (previousCompletion != null && now - previousCompletion < COMPLETION_DEDUPE_MS) return;
@@ -489,6 +517,7 @@ final class CodexBackgroundSocket {
 
     private synchronized void scheduleCompletionFallback(String threadId, String state) {
         cancelCompletionFallback(threadId);
+        if (threadParentIds.containsKey(threadId)) return;
         Runnable fallback = () -> {
             synchronized (CodexBackgroundSocket.this) {
                 completionTimers.remove(threadId);
@@ -593,6 +622,7 @@ final class CodexBackgroundSocket {
         clearPendingAttention(threadId);
         knownThreadIds.remove(threadId);
         threadTitles.remove(threadId);
+        threadParentIds.remove(threadId);
         threadStates.remove(threadId);
         lastCompletionAt.remove(threadId);
         cancelCompletionFallback(threadId);

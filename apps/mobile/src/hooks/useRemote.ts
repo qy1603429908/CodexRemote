@@ -37,6 +37,20 @@ function stringValue(...values: unknown[]): string | undefined {
   return values.find((value): value is string => typeof value === 'string' && value.length > 0);
 }
 
+export function shouldNotifyThreadCompletion(thread: Pick<RemoteThread, 'parentThreadId'> | undefined): boolean {
+  return !thread?.parentThreadId;
+}
+
+export function staleApprovalWireIds(
+  current: Array<Pick<ApprovalRequest, 'wireId'>>,
+  next: Array<Pick<ApprovalRequest, 'wireId'>>,
+): Array<number | string> {
+  const activeIds = new Set(next.map((approval) => String(approval.wireId)));
+  return current
+    .filter((approval) => !activeIds.has(String(approval.wireId)))
+    .map((approval) => approval.wireId);
+}
+
 function explicitThreadOwner(value: unknown): string | undefined {
   const data = record(value);
   return stringValue(data?.threadId, data?.conversationId, data?.ownerThreadId, data?.ownerConversationId);
@@ -1527,8 +1541,12 @@ export function useRemote(config: RemoteConfig | null) {
           return { ...current, [threadId]: completed };
         });
         if (failed && errorText && !isCompactionTurn) setLastError(errorText);
-        const threadTitle = threadsRef.current.find((thread) => thread.id === threadId)?.title ?? 'Codex 任务';
-        if (!isCompactionTurn) {
+        const completedThread = threadsRef.current.find((thread) => thread.id === threadId);
+        const threadTitle = completedThread?.title ?? 'Codex 任务';
+        // Subagent turns are implementation detail activity of their parent task.
+        // Notifying every child completion creates noisy “task completed” alerts
+        // that open the child instead of the task the user is following.
+        if (!isCompactionTurn && shouldNotifyThreadCompletion(completedThread)) {
           const notificationKey = `${threadId}:${turnId ?? String(turn?.completedAt ?? turn?.startedAt ?? '')}`;
           if (!notifiedTurnIdsRef.current.has(notificationKey)) {
             notifiedTurnIdsRef.current.add(notificationKey);
@@ -1928,6 +1946,24 @@ export function useRemote(config: RemoteConfig | null) {
         case 'event':
           handleEvent(message.method, message.params);
           break;
+        case 'approvals.snapshot': {
+          const next = message.approvals.map(normalizeApproval);
+          const staleIds = new Set(staleApprovalWireIds(approvalsRef.current, next).map(String));
+          const stale = approvalsRef.current.filter((approval) => staleIds.has(String(approval.wireId)));
+          approvalsRef.current = next;
+          setApprovals(next);
+          for (const approval of stale) {
+            const requestId = String(approval.wireId);
+            notificationGuardRef.current.invalidate(`approval:${requestId}`);
+            notifiedApprovalIdsRef.current.delete(requestId);
+            void queueApprovalCancellation(approval.wireId);
+            if (approval.threadId && !next.some((candidate) => candidate.threadId === approval.threadId)) {
+              clearThreadAttentionNotification(approval.threadId);
+              if (turnIdsRef.current[approval.threadId]) updateThreadState(approval.threadId, 'running');
+            }
+          }
+          break;
+        }
         case 'approval': {
           const normalized = normalizeApproval(message.approval);
           setApprovals((current) => {

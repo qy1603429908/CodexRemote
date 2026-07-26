@@ -158,6 +158,7 @@ export type ServerMessagePayload =
   | { type: "thread.diff"; requestId?: string; snapshot: GitDiffSnapshot }
   | { type: "turn.started"; requestId?: string; threadId: string; turn: unknown }
   | { type: "approval"; approval: ApprovalRequest }
+  | { type: "approvals.snapshot"; approvals: ApprovalRequest[] }
   | { type: "approval.resolved"; requestId?: string; approvalRequestId: number | string }
   | { type: "event"; method: string; params: unknown }
   | { type: "status"; codexReady: boolean; detail?: string }

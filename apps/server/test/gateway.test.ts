@@ -477,6 +477,54 @@ describe("MobileGateway", () => {
     ws.close();
   });
 
+  it("sends an authoritative approval snapshot on reconnect", async () => {
+    const { port } = await start();
+    const encoded = Buffer.from(token).toString("base64url");
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`, ["codex-mobile-v1", `token.${encoded}`], { origin: "capacitor://localhost" });
+    const messages: Array<Record<string, unknown>> = [];
+    ws.on("message", (data) => messages.push(JSON.parse(data.toString())));
+    await new Promise<void>((resolve, reject) => { ws.once("open", resolve); ws.once("error", reject); });
+    await waitFor(() => messages.some((message) => message.type === "approvals.snapshot"));
+    expect(messages.find((message) => message.type === "approvals.snapshot")).toMatchObject({ approvals: [] });
+    ws.close();
+  });
+
+  it("suppresses mirrored app-server command approvals for Desktop-owned tasks but keeps MCP elicitations", async () => {
+    const desktop = new FakeDesktop();
+    const { bridge, gateway } = await start(desktop);
+    desktop.emit("snapshot", desktop.conversation);
+    bridge.emit("serverRequest", {
+      id: 81,
+      method: "item/commandExecution/requestApproval",
+      params: { threadId: "thread-1", turnId: "turn-active", itemId: "command-1", command: "echo mirrored" },
+    });
+    bridge.emit("serverRequest", {
+      id: 82,
+      method: "mcpServer/elicitation/request",
+      params: { threadId: "thread-1", turnId: "turn-active", message: "Allow Computer Use?" },
+    });
+    const approvals = (gateway as unknown as { approvals: Map<string | number, unknown> }).approvals;
+    await waitFor(() => approvals.has(82));
+    expect(approvals.has(81)).toBe(false);
+    expect(approvals.has(82)).toBe(true);
+  });
+
+  it("clears an app-server approval when the corresponding item completes", async () => {
+    const { bridge, gateway } = await start();
+    bridge.emit("serverRequest", {
+      id: 91,
+      method: "item/commandExecution/requestApproval",
+      params: { threadId: "thread-1", turnId: "turn-1", itemId: "command-1", command: "echo hi" },
+    });
+    const approvals = (gateway as unknown as { approvals: Map<string | number, unknown> }).approvals;
+    await waitFor(() => approvals.has(91));
+    bridge.emit("notification", {
+      method: "item/completed",
+      params: { threadId: "thread-1", turnId: "turn-1", item: { id: "command-1", status: "failed" } },
+    });
+    await waitFor(() => !approvals.has(91));
+  });
+
   it("routes command approvals back to app-server", async () => {
     const { bridge, port } = await start();
     const encoded = Buffer.from(token).toString("base64url");

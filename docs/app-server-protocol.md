@@ -1472,3 +1472,24 @@ agentsStates
 ### 13.3 端到端证据
 
 线程 `019f9dc5-ed9f-72d1-8af6-3108eeaf381f` 在 Redmi Note 14 Pro+ 显示 Computer Use 审批；手机批准后，`node_repl.js` 读取 `com.apple.SystemProfiler` 成功，MCP item 为 `completed`，turn 为 `completed`，持续 `59358 ms`，最终回复“读取成功。”。
+
+## 14. 手机桥接层的审批权威快照（v0.3.8）
+
+app-server 的 `serverRequest/resolved` 是增量事件；手机在断网、WebView 冻结或服务重连期间可能漏掉该事件。因此增量 `approval` / `approval.resolved` 不能单独作为客户端 pending 审批的最终事实。
+
+Host WebSocket 在鉴权成功后发送：
+
+```ts
+{
+  type: "approvals.snapshot";
+  approvals: ApprovalRequest[];
+}
+```
+
+语义是**全量替换**：客户端保留快照中的审批，删除其余本地审批卡、状态和系统通知。为兼容旧 APK，Host 在快照前仍逐条发送当前 `approval`；新客户端最终以 `approvals.snapshot` 为准。
+
+Desktop GUI-owned 任务还有额外的权威边界：
+
+- Desktop IPC 已就绪且 thread 已由 Desktop canonical 快照确认时，命令、文件修改和权限类 app-server 镜像审批不再转发给手机；
+- `mcpServer/elicitation/request`（包括 Computer Use）仍必须转发，因为它是原生 MCP 人工交互，不是 Desktop 命令审批镜像；
+- `item/completed`、`item/commandExecution/completed`、`item/fileChange/completed` 和 `turn/completed` 会主动清除对应 app-server pending 审批，避免仅依赖可能漏收的 resolved 事件。

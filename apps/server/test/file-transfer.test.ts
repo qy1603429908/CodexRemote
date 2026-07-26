@@ -136,6 +136,27 @@ describe("file transfer primitives", () => {
     await expect(readFile(upload.path)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
+  it("keeps committed message attachments across expiry and process restart cleanup", async () => {
+    let now = 10_000;
+    const { root, uploads, manager } = await fixture({ now: () => now });
+    const upload = await manager.receiveUpload({ stream: Readable.from("persistent image"), fileName: "image.png", mimeType: "image/png" });
+    await expect(manager.commitUpload(upload.uploadId)).resolves.toBe(true);
+
+    now += 10_000;
+    expect(await manager.cleanupExpired()).toEqual({ downloads: 0, uploads: 0 });
+    expect(await readFile(upload.path, "utf8")).toBe("persistent image");
+
+    const restarted = await FileTransferManager.create({
+      allowedRoots: [root],
+      uploadDirectory: uploads,
+      downloadTtlMs: 1_000,
+      uploadTtlMs: 2_000,
+      now: () => now,
+    });
+    await expect(restarted.cleanupOrphanedUploads()).resolves.toBe(0);
+    expect(await readFile(upload.path, "utf8")).toBe("persistent image");
+  });
+
   it.skipIf(process.platform === "win32")("requires upload storage to remain inside an allowed root after symlink resolution", async () => {
     const root = await mkdtemp(join(tmpdir(), "cmr-root-"));
     const outside = await mkdtemp(join(tmpdir(), "cmr-storage-outside-"));
