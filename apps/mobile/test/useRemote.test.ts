@@ -1,10 +1,29 @@
 import { describe, expect, it } from 'vitest';
-import { applyPendingMessageDeltas, canonicalProjectedItems, compactionStatusFromThreadPayload, consumeThreadActivationIntent, contextCompactionItemIdsFromThreadPayload, createSelectedMessagesSelector, dedupeMessages, eventThreadId, normalizeThreadPayload, optimisticAttachmentsFromUploads, reconcileMessages, reconcileThreadSnapshot, stateFromStatus, turnIdsAfterSnapshot, visibleUserText } from '../src/hooks/useRemote';
+import { applyPendingMessageDeltas, canonicalProjectedItems, compactionStatusFromThreadPayload, consumeThreadActivationIntent, contextCompactionItemIdsFromThreadPayload, createSelectedMessagesSelector, dedupeMessages, eventThreadId, isActiveTurnStatus, normalizeThreadPayload, optimisticAttachmentsFromUploads, permissionModeLabel, reconcileMessages, reconcileThreadSnapshot, shouldApplyPermissionModeSnapshot, stateFromStatus, turnIdsAfterSnapshot, visibleUserText } from '../src/hooks/useRemote';
 import type { RemoteMessage } from '../src/types/protocol';
 
 function user(id: string, content: string, createdAt: number): RemoteMessage {
   return { id, threadId: 'thread', role: 'user', content, createdAt, status: 'complete' };
 }
+
+
+
+describe('Permission mode synchronization', () => {
+  it('keeps a recent optimistic choice from being reverted by a stale thread snapshot', () => {
+    const override = { mode: 'full-access' as const, expiresAt: 20_000 };
+    expect(shouldApplyPermissionModeSnapshot('auto', override, 10_000)).toBe(false);
+    expect(shouldApplyPermissionModeSnapshot('full-access', override, 10_000)).toBe(true);
+    expect(shouldApplyPermissionModeSnapshot('auto', override, 20_000)).toBe(true);
+  });
+
+  it('uses concise user-facing labels for every permission mode', () => {
+    expect(permissionModeLabel('auto')).toBe('自动 · 工作区');
+    expect(permissionModeLabel('granular')).toBe('严格确认');
+    expect(permissionModeLabel('read-only')).toBe('严格审阅 · 只读');
+    expect(permissionModeLabel('guardian-approvals')).toBe('替我审阅');
+    expect(permissionModeLabel('full-access')).toBe('完全访问');
+  });
+});
 
 
 describe('Buffered streaming deltas', () => {
@@ -417,6 +436,55 @@ describe('Desktop canonical item parsing', () => {
     } });
     expect(normalized.messages.map((message) => message.id)).toEqual(['z-user', 'a-answer', 'call-later']);
     expect(normalized.messages.map((message) => message.createdAt)).toEqual([100_000, 100_000, 100_000]);
+    expect(normalized.messages.map((message) => message.timestampSource)).toEqual(['turn', 'turn', 'turn']);
+  });
+
+  it('marks only an item-level timestamp as exact', () => {
+    const normalized = normalizeThreadPayload({ thread: {
+      id: 'thread',
+      turns: [{
+        id: 'turn',
+        status: 'inProgress',
+        startedAt: 100,
+        items: [{ type: 'commandExecution', id: 'call', command: 'pwd', createdAt: '2026-07-26T14:42:00+08:00' }],
+      }],
+    } });
+    expect(normalized.messages[0]).toMatchObject({
+      id: 'call',
+      createdAt: new Date('2026-07-26T14:42:00+08:00').getTime(),
+      timestampSource: 'item',
+    });
+  });
+
+  it('does not let a later snapshot overwrite a precise live item time with the turn start time', () => {
+    const live: RemoteMessage = {
+      ...user('call', '$ pwd', new Date('2026-07-26T14:42:00+08:00').getTime()),
+      role: 'tool',
+      turnId: 'turn',
+      itemType: 'commandExecution',
+      toolName: '命令',
+      timestampSource: 'live',
+    };
+    const fallback: RemoteMessage = {
+      ...live,
+      createdAt: new Date('2026-07-26T12:53:00+08:00').getTime(),
+      timestampSource: 'turn',
+    };
+    expect(reconcileThreadSnapshot([live], [fallback])).toEqual([live]);
+  });
+
+  it('records the first observation time for a newly appearing item in the active turn', () => {
+    const existing = { ...user('existing', 'earlier', 100_000), turnId: 'turn', timestampSource: 'turn' as const };
+    const incoming = [
+      existing,
+      { ...user('new-tool', '$ git status', 100_000), role: 'tool' as const, turnId: 'turn', timestampSource: 'turn' as const },
+    ];
+    const observedAt = new Date('2026-07-26T15:04:00+08:00').getTime();
+    expect(reconcileThreadSnapshot([existing], incoming, 'thread', 'turn', observedAt)[1]).toMatchObject({
+      id: 'new-tool',
+      createdAt: observedAt,
+      timestampSource: 'observed',
+    });
   });
 
   it('renders steeringUserMessage from restoreMessage without ambient context', () => {
@@ -523,6 +591,30 @@ describe('Desktop canonical item parsing', () => {
   });
 
 
+  it('lets a shorter current reasoning snapshot replace a longer stale summary with the same id', () => {
+    const stale: RemoteMessage = {
+      id: 'reason', threadId: 'thread', turnId: 'turn', role: 'system',
+      content: '正在继续排查数小时前的 JWT 更新与权限同步问题', createdAt: 1,
+      status: 'streaming', itemType: 'reasoning', toolName: '思考梗概',
+    };
+    const current: RemoteMessage = {
+      ...stale, content: '检查通知声音', createdAt: 2,
+    };
+    expect(reconcileThreadSnapshot([stale], [current])).toEqual([current]);
+  });
+
+  it('keeps a newer opaque live reasoning item that a delayed Desktop snapshot has not included yet', () => {
+    const live: RemoteMessage = {
+      id: 'rs_live', threadId: 'thread', turnId: 'turn', role: 'system',
+      content: '实时新梗概', createdAt: 2, status: 'streaming', itemType: 'reasoning', toolName: '思考梗概',
+    };
+    const delayedSnapshot: RemoteMessage = {
+      id: 'rs_old', threadId: 'thread', turnId: 'turn', role: 'system',
+      content: 'Desktop 旧梗概', createdAt: 1, status: 'streaming', itemType: 'reasoning', toolName: '思考梗概',
+    };
+    expect(reconcileThreadSnapshot([live], [delayedSnapshot])).toEqual([delayedSnapshot, live]);
+  });
+
   it('drops a stale synthetic reasoning tail when a newer Desktop snapshot is authoritative', () => {
     const stale: RemoteMessage = {
       id: 'turn_item/reasoning/summaryTextDelta', threadId: 'thread', turnId: 'turn', role: 'system',
@@ -547,6 +639,20 @@ describe('Desktop canonical item parsing', () => {
     expect(normalized.thread).toMatchObject({
       id: 'child', parentThreadId: 'parent', agentNickname: 'Singer', agentRole: 'reviewer',
     });
+  });
+
+  it.each(['inProgress', 'in_progress', 'running', 'active', 'started'])('recognizes %s as an active turn status', (status) => {
+    expect(isActiveTurnStatus(status)).toBe(true);
+    const normalized = normalizeThreadPayload({ thread: {
+      id: 'thread',
+      turns: [{ id: 'turn', status, items: [{ type: 'reasoning', id: 'reason', summary: ['当前梗概'] }] }],
+    } });
+    expect(normalized.currentTurnId).toBe('turn');
+    expect(normalized.messages[0]?.status).toBe('streaming');
+  });
+
+  it.each(['completed', 'failed', 'interrupted', 'idle'])('does not recognize %s as an active turn status', (status) => {
+    expect(isActiveTurnStatus(status)).toBe(false);
   });
 
   it('keeps reasoning from the active Desktop turn as transient streaming state', () => {

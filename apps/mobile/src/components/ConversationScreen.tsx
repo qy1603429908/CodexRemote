@@ -25,6 +25,7 @@ interface ConversationScreenProps {
   selectedModel: string;
   selectedEffort: string;
   selectedPermissionMode: PermissionMode;
+  permissionModeStatus: string;
   phase: ConnectionPhase;
   phaseDetail: string;
   running: boolean;
@@ -92,34 +93,53 @@ export function subagentsFromMessage(message: RemoteMessage): AgentTarget[] {
 
   const agents = new Map<string, AgentTarget>();
   const detail = record(message.detail);
-  const states = record(detail?.agentsStates) ?? record(record(detail?.item)?.agentsStates);
+  const nestedItem = record(detail?.item);
+  const states = record(detail?.agentsStates) ?? record(nestedItem?.agentsStates);
+  const receiverThreads = detail?.receiverThreads ?? nestedItem?.receiverThreads;
+  if (Array.isArray(receiverThreads)) for (const value of receiverThreads) {
+    const receiver = record(value);
+    const thread = record(receiver?.thread) ?? receiver;
+    const id = String(receiver?.threadId ?? thread?.id ?? '');
+    if (!id) continue;
+    const source = record(thread?.source);
+    const sourceSubagent = record(source?.subAgent) ?? record(source?.subagent);
+    const spawn = record(sourceSubagent?.thread_spawn) ?? record(sourceSubagent?.threadSpawn);
+    const status = record(thread?.status);
+    const state = String(record(states?.[id])?.status ?? status?.type ?? thread?.state ?? (message.status === 'streaming' ? 'active' : 'unknown'));
+    const label = String(thread?.agentNickname ?? thread?.agent_nickname ?? spawn?.agent_nickname ?? spawn?.agentNickname ?? thread?.name ?? thread?.title ?? id.slice(0, 8));
+    mergeAgentTarget(agents, { id, label, state });
+  }
   if (states) {
     for (const [id, value] of Object.entries(states)) {
       const agent = record(value);
       mergeAgentTarget(agents, { id, label: String(agent?.nickname ?? agent?.name ?? id.slice(0, 8)), state: String(agent?.status ?? 'active') });
     }
   }
-  const receiverIds = detail?.receiverThreadIds ?? record(detail?.item)?.receiverThreadIds;
+  const receiverIds = detail?.receiverThreadIds ?? nestedItem?.receiverThreadIds;
   if (Array.isArray(receiverIds)) for (const value of receiverIds) {
     const id = String(value);
     if (!agents.has(id)) mergeAgentTarget(agents, { id, label: id.slice(0, 8), state: message.status === 'streaming' ? 'active' : 'unknown' });
   }
 
   // Compact mobile caches intentionally drop bulky raw event details. Recover stable
-  // thread IDs from collaboration text after a restart or Desktop snapshot replace.
-  const lines = message.content.split('\n');
-  const ids = new Set<string>();
-  for (const line of lines) {
-    const trimmed = line.trim();
-    const isActivity = type.includes('subagentactivity') || name === 'subagent 活动';
-    const isBareActivityId = isActivity && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(trimmed);
-    if (!trimmed.startsWith('Agent:') && !/^[0-9a-f]{8}-[0-9a-f-]{27}:\s/i.test(trimmed) && !isBareActivityId) continue;
-    for (const match of trimmed.matchAll(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi)) ids.add(match[0]!);
-  }
-  for (const id of ids) {
-    const stateLine = lines.find((line) => line.trimStart().startsWith(`${id}:`));
-    const state = stateLine?.slice(stateLine.indexOf(':') + 1).split('—')[0]?.trim();
-    mergeAgentTarget(agents, { id, label: id.slice(0, 8), state: state || (message.status === 'streaming' ? 'active' : 'unknown') });
+  // thread IDs from collaboration text only when no structured target survived. Scanning
+  // a completed Subagent report can otherwise mistake UUID examples in its body for the
+  // target of this tool call.
+  if (agents.size === 0) {
+    const lines = message.content.split('\n');
+    const ids = new Set<string>();
+    for (const line of lines) {
+      const trimmed = line.trim();
+      const isActivity = type.includes('subagentactivity') || name === 'subagent 活动';
+      const isBareActivityId = isActivity && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(trimmed);
+      if (!trimmed.startsWith('Agent:') && !/^[0-9a-f]{8}-[0-9a-f-]{27}:\s/i.test(trimmed) && !isBareActivityId) continue;
+      for (const match of trimmed.matchAll(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi)) ids.add(match[0]!);
+    }
+    for (const id of ids) {
+      const stateLine = lines.find((line) => line.trimStart().startsWith(`${id}:`));
+      const state = stateLine?.slice(stateLine.indexOf(':') + 1).split('—')[0]?.trim();
+      mergeAgentTarget(agents, { id, label: id.slice(0, 8), state: state || (message.status === 'streaming' ? 'active' : 'unknown') });
+    }
   }
   const result = agents.size > 0 ? [...agents.values()] : EMPTY_AGENT_TARGETS;
   agentTargetsByMessage.set(message, result);
@@ -187,6 +207,50 @@ export function groupConsecutiveToolMessages(messages: RemoteMessage[]): Convers
   return entries;
 }
 
+function isOpaqueAgentLabel(label: string, id: string): boolean {
+  const normalized = label.trim();
+  if (!normalized || normalized === id || normalized === id.slice(0, 8)) return true;
+  return /^[0-9a-f]{8}(?:-[0-9a-f-]{8,})?$/i.test(normalized);
+}
+
+function threadAgentState(thread: RemoteThread, fallback: string): string {
+  if (thread.state === 'running') return 'active';
+  if (thread.state === 'error') return 'failed';
+  if (thread.state === 'idle') return 'complete';
+  return thread.state || fallback;
+}
+
+export function resolveConversationEntryAgentNames(
+  entries: ConversationEntry[],
+  threads: RemoteThread[],
+): ConversationEntry[] {
+  const threadsById = new Map(threads.map((thread) => [thread.id, thread] as const));
+  const resolveTargets = (targets: AgentTarget[]): AgentTarget[] => targets.flatMap((target) => {
+    const thread = threadsById.get(target.id);
+    const candidates = [thread?.agentNickname, target.label, thread?.title]
+      .filter((value): value is string => typeof value === 'string' && !isOpaqueAgentLabel(value, target.id));
+    const label = candidates[0]?.trim();
+    if (!label) return [];
+    return [{ ...target, label, state: thread ? threadAgentState(thread, target.state) : target.state }];
+  });
+
+  return entries.map((entry) => {
+    if (entry.type === 'message') return { ...entry, agentTargets: resolveTargets(entry.agentTargets) };
+    const agentTargetsByMessage: Record<string, AgentTarget[]> = {};
+    const aggregate = new Map<string, AgentTarget>();
+    for (const message of entry.messages) {
+      const targets = resolveTargets(entry.agentTargetsByMessage[message.id] ?? []);
+      agentTargetsByMessage[message.id] = targets;
+      for (const target of targets) mergeAgentTarget(aggregate, target);
+    }
+    return {
+      ...entry,
+      agentTargets: aggregate.size > 0 ? [...aggregate.values()] : EMPTY_AGENT_TARGETS,
+      agentTargetsByMessage,
+    };
+  });
+}
+
 export function subagentsFromConversationEntries(entries: ConversationEntry[]): AgentTarget[] {
   const agents = new Map<string, AgentTarget>();
   for (const entry of entries) for (const agent of entry.agentTargets) mergeAgentTarget(agents, agent);
@@ -244,7 +308,7 @@ export function visibleConversationContentKey(
   return `${entryKey}::${approvalKey}`;
 }
 
-export function ConversationScreen({ thread, messages, subagents: threadSubagents, approvals, compaction, promptQueue, gitDiff, models, skills, selectedModel, selectedEffort, selectedPermissionMode, phase, phaseDetail, running, canInterrupt, currentTurnId, historyHasMore, historyLoading, selectedAgentId, onSelectAgent, onBack, onLoadOlderHistory, onReconnect, onSend, onCancelQueuedPrompt, onPromoteQueuedPrompt, onResumePromptQueue, onRefreshGitDiff, onInterrupt, onSelectModel, onSelectEffort, onSelectPermissionMode, onResolveApproval, onDismissCompaction, onOpenThread, onLoadAttachment, onDownloadAttachment }: ConversationScreenProps) {
+export function ConversationScreen({ thread, messages, subagents: threadSubagents, approvals, compaction, promptQueue, gitDiff, models, skills, selectedModel, selectedEffort, selectedPermissionMode, permissionModeStatus, phase, phaseDetail, running, canInterrupt, currentTurnId, historyHasMore, historyLoading, selectedAgentId, onSelectAgent, onBack, onLoadOlderHistory, onReconnect, onSend, onCancelQueuedPrompt, onPromoteQueuedPrompt, onResumePromptQueue, onRefreshGitDiff, onInterrupt, onSelectModel, onSelectEffort, onSelectPermissionMode, onResolveApproval, onDismissCompaction, onOpenThread, onLoadAttachment, onDownloadAttachment }: ConversationScreenProps) {
   const streamRef = useRef<HTMLElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
   const followingRef = useRef(true);
@@ -262,7 +326,10 @@ export function ConversationScreen({ thread, messages, subagents: threadSubagent
 
   const visibleMessages = useMemo(() => messages.filter((message) => !isContextMessage(message)), [messages]);
   const reasoning = useMemo(() => latestReasoning(messages, currentTurnId), [currentTurnId, messages]);
-  const conversationEntries = useMemo(() => groupConsecutiveToolMessages(visibleMessages), [visibleMessages]);
+  const conversationEntries = useMemo(
+    () => resolveConversationEntryAgentNames(groupConsecutiveToolMessages(visibleMessages), threadSubagents),
+    [threadSubagents, visibleMessages],
+  );
   const historyEntryGrowth = historyAnchorRef.current
     ? Math.max(0, conversationEntries.length - previousEntryCountRef.current)
     : 0;
@@ -282,7 +349,7 @@ export function ConversationScreen({ thread, messages, subagents: threadSubagent
     for (const agent of threadSubagents) {
       combined.set(agent.id, {
         id: agent.id,
-        label: agent.agentNickname || agent.title || agent.id.slice(0, 8),
+        label: agent.agentNickname || agent.title || 'Subagent',
         state: agent.state === 'running' ? 'active' : agent.state === 'error' ? 'failed' : agent.state === 'idle' ? 'complete' : agent.state,
         thread: agent,
       });
@@ -441,7 +508,7 @@ export function ConversationScreen({ thread, messages, subagents: threadSubagent
         </label>
         <label>
           <span>权限 / 审阅</span>
-          <select value={selectedPermissionMode} onChange={(event) => onSelectPermissionMode(event.target.value as PermissionMode)} disabled={phase !== 'connected' || running}>
+          <select value={selectedPermissionMode} onChange={(event) => onSelectPermissionMode(event.target.value as PermissionMode)} disabled={phase !== 'connected'}>
             <option value="auto">自动 · 工作区</option>
             <option value="granular">严格确认</option>
             <option value="read-only">严格审阅 · 只读</option>
@@ -453,6 +520,7 @@ export function ConversationScreen({ thread, messages, subagents: threadSubagent
           <span />
           <strong>{running ? <>执行中{thread.currentTurnStartedAt && <> · <ElapsedTime startedAt={thread.currentTurnStartedAt} /></>}</> : thread.state === 'waiting_approval' ? '等待授权' : thread.state === 'waiting_input' ? '等待输入' : thread.state === 'error' ? '异常' : thread.state === 'idle' ? '可继续' : thread.state === 'not_loaded' ? '未载入' : '等待同步'}</strong>
         </div>
+        {permissionModeStatus && <div className="permission-mode-status" role="status" aria-live="polite">{permissionModeStatus}</div>}
       </section>
 
       {subagents.length > 0 && (
@@ -560,37 +628,9 @@ export function ConversationScreen({ thread, messages, subagents: threadSubagent
                   <strong>工具调用 · {entry.messages.length}</strong>
                   <small>{entry.messages.map((message) => message.toolName || '工具').slice(0, 3).join('、')}{entry.messages.length > 3 ? '…' : ''}</small>
                   <span className="tool-group-summary-actions">
-                    {entry.agentTargets.slice(0, 2).map((agent) => (
-                      <button
-                        className="tool-group-summary-agent"
-                        key={agent.id}
-                        type="button"
-                        title={`打开 ${agent.label}`}
-                        onClick={(event) => {
-                          event.preventDefault();
-                          event.stopPropagation();
-                          onOpenThread(agent.id);
-                        }}
-                      >
-                        <span aria-hidden="true" />
-                        {agent.label}
-                      </button>
-                    ))}
-                    {entry.agentTargets.length > 2 && <span className="tool-group-agent-more">+{entry.agentTargets.length - 2}</span>}
                     <span className="tool-group-action">展开</span>
                   </span>
                 </summary>
-                {entry.agentTargets.length > 0 && (
-                  <nav className="message-agent-links tool-group-agent-links" aria-label="此工具组关联的 Subagent">
-                    {entry.agentTargets.map((agent) => (
-                      <button key={agent.id} type="button" onClick={() => onOpenThread(agent.id)}>
-                        <span aria-hidden="true" />
-                        <strong>{agent.label}</strong>
-                        <small>打开</small>
-                      </button>
-                    ))}
-                  </nav>
-                )}
                 {expandedToolGroupIds.has(entry.id) && (
                   <div className="tool-call-group-items">
                     {entry.messages.map((message) => <MessageBubble key={message.id} message={message} agentTargets={entry.agentTargetsByMessage[message.id] ?? []} onOpenAgent={onOpenThread} onLoadAttachment={onLoadAttachment} onDownloadAttachment={onDownloadAttachment} />)}
@@ -598,7 +638,7 @@ export function ConversationScreen({ thread, messages, subagents: threadSubagent
                 )}
               </details>
             ))}
-            {approvals.map((approval) => <ApprovalCard key={approval.id} approval={approval} onResolve={onResolveApproval} />)}
+            {approvals.map((approval) => <ApprovalCard key={approval.id} approval={approval} permissionMode={selectedPermissionMode} onResolve={onResolveApproval} />)}
           </div>
         </section>
         {hasNewContent && (

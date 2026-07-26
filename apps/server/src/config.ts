@@ -1,6 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
 import { homedir, hostname } from "node:os";
 import { join } from "node:path";
+import {
+  detectPackagedNodeReplRuntime,
+  nodeReplRuntimeConfigArgs,
+  type PackagedNodeReplRuntime,
+} from "./codex-runtime.js";
 
 export interface ServerConfig {
   host: string;
@@ -9,6 +14,8 @@ export interface ServerConfig {
   tokenDigest: Buffer;
   allowedOrigins: Set<string>;
   codexBin: string;
+  codexArgs: string[];
+  packagedNodeReplRuntime: PackagedNodeReplRuntime | null;
   codexHome: string;
   serverId: string;
   desktopIpc: boolean;
@@ -51,6 +58,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
   // downloadable until the operator explicitly opts directories in.
   const fileRoots = configuredFileRoots.length > 0 ? configuredFileRoots : [uploadDirectory];
 
+  const codexHome = env.CODEX_HOME?.trim() || join(homedir(), ".codex");
+  const packagedNodeReplRuntime = detectPackagedNodeReplRuntime({ env });
+
   return {
     host,
     port,
@@ -58,7 +68,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     tokenDigest: createHash("sha256").update(token).digest(),
     allowedOrigins: new Set([...defaultOrigins, ...configuredOrigins]),
     codexBin: env.CODEX_BIN ?? "codex",
-    codexHome: env.CODEX_HOME?.trim() || join(homedir(), ".codex"),
+    codexArgs: nodeReplRuntimeConfigArgs(packagedNodeReplRuntime, codexHome),
+    packagedNodeReplRuntime,
+    codexHome,
     serverId: env.CMR_SERVER_ID ?? `${hostname()}-${randomUUID().slice(0, 8)}`,
     desktopIpc: env.CMR_DESKTOP_IPC !== "0",
     desktopIpcEndpoint: env.CMR_DESKTOP_IPC_ENDPOINT?.trim() || undefined,

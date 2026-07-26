@@ -2,6 +2,23 @@ import { describe, expect, it } from "vitest";
 import { cacheScope, clearRemoteCache, compactCache, loadRemoteCache, messagesForThread, type RemoteCacheSnapshot } from "../src/lib/remoteCache";
 
 describe("remote cache", () => {
+  it("does not persist streaming reasoning summaries as durable conversation history", () => {
+    const reasoning = {
+      id: "reason", threadId: "thread", turnId: "turn", role: "system" as const, content: "数小时前的旧梗概",
+      createdAt: 1, status: "streaming" as const, itemType: "reasoning", toolName: "思考梗概",
+    };
+    const durable = {
+      id: "answer", threadId: "thread", turnId: "turn", role: "assistant" as const, content: "保留的回答",
+      createdAt: 2, status: "complete" as const,
+    };
+    const snapshot: RemoteCacheSnapshot = {
+      schema: 4, savedAt: 1, syncCursor: 0, threadIndexVersion: 1, selectedThreadId: "thread",
+      threads: [{ id: "thread", title: "task", preview: "", updatedAt: 2, state: "running", unread: 0, cwd: "/tmp", modelProvider: "" }],
+      messagesByThread: { thread: [reasoning, durable] }, historyByThread: {},
+    };
+    expect(compactCache(snapshot).messagesByThread.thread).toEqual([durable]);
+  });
+
   it("uses endpoint and token as an isolated stable scope", () => {
     expect(cacheScope("HTTPS://HOST/", "token")).toBe(cacheScope("https://host", "token"));
     expect(cacheScope("https://host", "token-a")).not.toBe(cacheScope("https://host", "token-b"));

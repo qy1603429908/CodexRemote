@@ -224,6 +224,8 @@ export interface RemoteMessage {
   content: string;
   attachments?: RemoteAttachment[];
   createdAt: number;
+  /** Provenance for createdAt. Turn timestamps are ordering-only and must not be rendered as item times. */
+  timestampSource?: 'item' | 'live' | 'observed' | 'turn';
   completedAt?: number;
   durationMs?: number;
   status: 'streaming' | 'complete' | 'failed';
@@ -239,6 +241,7 @@ export interface ApprovalRequest {
   threadId?: string;
   turnId?: string;
   title: string;
+  method: string;
   description?: string;
   command?: string;
   cwd?: string;

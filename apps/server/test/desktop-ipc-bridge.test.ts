@@ -18,6 +18,42 @@ async function waitUntil(predicate: () => boolean, timeoutMs = 2_000): Promise<v
   }
 }
 
+describe("Desktop IPC approval forwarding", () => {
+  it("forwards native Computer Use elicitation responses with the Desktop follower payload", async () => {
+    const bridge = new DesktopIpcBridge(false);
+    const calls: Array<{ conversationId: string; method: string; params: Record<string, unknown> }> = [];
+    const internal = bridge as unknown as {
+      requestFollower(
+        conversationId: string,
+        method: string,
+        params: Record<string, unknown>,
+      ): Promise<Record<string, unknown>>;
+    };
+    internal.requestFollower = async (conversationId, method, params) => {
+      calls.push({ conversationId, method, params });
+      return { ok: true };
+    };
+
+    const response = { action: "accept", content: null, _meta: null };
+    await bridge.resolveApproval(
+      "thread-cu",
+      "mcpServer/elicitation/request",
+      47,
+      response,
+    );
+
+    expect(calls).toEqual([{
+      conversationId: "thread-cu",
+      method: "thread-follower-submit-mcp-server-elicitation-response",
+      params: {
+        conversationId: "thread-cu",
+        requestId: 47,
+        response,
+      },
+    }]);
+  });
+});
+
 describe("Desktop IPC canonical history", () => {
   it("converts canonical turnHistory islands into ordered turns", () => {
     const first = { turnId: "turn-1", status: "completed", items: [{ type: "userMessage", content: "one" }] };

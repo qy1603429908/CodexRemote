@@ -25,6 +25,7 @@ interface PendingRequest {
 
 export interface AppServerBridgeOptions {
   codexBin: string;
+  codexArgs?: string[];
   requestTimeoutMs?: number;
   restartDelayMs?: number;
   env?: NodeJS.ProcessEnv;
@@ -62,7 +63,12 @@ export class AppServerBridge extends EventEmitter {
   }
 
   private async spawnAndInitialize(): Promise<void> {
-    const child = spawn(this.options.codexBin, ["app-server", "--listen", "stdio://"], {
+    const child = spawn(this.options.codexBin, [
+      ...(this.options.codexArgs ?? []),
+      "app-server",
+      "--listen",
+      "stdio://",
+    ], {
       env: this.options.env ?? process.env,
       stdio: ["pipe", "pipe", "pipe"],
       shell: false,
@@ -88,7 +94,14 @@ export class AppServerBridge extends EventEmitter {
     try {
       const initializeResult = await this.request("initialize", {
         clientInfo: { name: "codex-mobile-remote", title: "Codex Mobile Remote", version: "0.3.2" },
-        capabilities: { experimentalApi: true, requestAttestation: false },
+        capabilities: {
+          experimentalApi: true,
+          requestAttestation: false,
+          // node_repl exposes Computer Use approvals through MCP elicitation.
+          // Without this capability nodeRepl.createElicitation is absent and
+          // every native Computer Use call fails before reaching the phone.
+          mcpServerOpenaiFormElicitation: true,
+        },
       });
       if (this.options.expectedCodexHome) {
         const actualCodexHome = record(initializeResult)?.codexHome;

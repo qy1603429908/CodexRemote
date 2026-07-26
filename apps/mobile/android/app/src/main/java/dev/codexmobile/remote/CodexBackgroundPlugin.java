@@ -143,19 +143,30 @@ public class CodexBackgroundPlugin extends Plugin {
         String action = defaultValue(call.getString("action"), "openApproval");
         String title = defaultValue(call.getString("title"), getString(R.string.approval_notification_title));
         String text = defaultValue(call.getString("text"), getString(R.string.approval_notification_text));
+        String alertKind = defaultValue(call.getString("alertKind"), "openThread".equals(action) ? "input" : "approval");
+        String channel = "input".equals(alertKind) ? CodexNotificationChannels.INPUTS : CodexNotificationChannels.APPROVALS;
         int id = notificationId("approval", threadId, call.getInt("notificationId"));
-        showNotification(
-                CodexNotificationChannels.APPROVALS,
-                "approval",
-                threadId,
-                action,
-                title,
-                text,
-                id,
-                NotificationCompat.PRIORITY_HIGH,
-                NotificationCompat.CATEGORY_EVENT,
-                true);
-        new CodexNotificationLedger(getContext()).putNotification(id, threadId);
+        CodexNotificationLedger ledger = new CodexNotificationLedger(getContext());
+        if (!ledger.claimNotification(id, threadId)) {
+            resolveNotification(call, id, "approval", threadId);
+            return;
+        }
+        try {
+            showNotification(
+                    channel,
+                    "approval",
+                    threadId,
+                    action,
+                    title,
+                    text,
+                    id,
+                    NotificationCompat.PRIORITY_HIGH,
+                    NotificationCompat.CATEGORY_EVENT,
+                    true);
+        } catch (RuntimeException error) {
+            ledger.removeNotification(id);
+            throw error;
+        }
         resolveNotification(call, id, "approval", threadId);
     }
 
@@ -266,7 +277,7 @@ public class CodexBackgroundPlugin extends Plugin {
                 .setPriority(priority)
                 .setCategory(category)
                 .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
-                .setOnlyAlertOnce(true)
+                .setOnlyAlertOnce(false)
                 .setGroup("codex-thread-" + threadId);
         if (alert && Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
             builder.setDefaults(Notification.DEFAULT_SOUND | Notification.DEFAULT_VIBRATE);
@@ -277,6 +288,13 @@ public class CodexBackgroundPlugin extends Plugin {
             throw new SecurityException("Notification permission was revoked");
         }
         NotificationManagerCompat.from(getContext()).notify(notificationId, builder.build());
+        if (alert) CodexNotificationChannels.playVendorAlertFallback(getContext(), alertKindForChannel(channel));
+    }
+
+    private String alertKindForChannel(String channel) {
+        if (CodexNotificationChannels.APPROVALS.equals(channel)) return "approval";
+        if (CodexNotificationChannels.INPUTS.equals(channel)) return "input";
+        return "completion";
     }
 
     private void captureNotificationIntent(Intent intent, boolean notify) {

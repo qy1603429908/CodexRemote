@@ -181,6 +181,7 @@ export function App() {
           selectedModel={remote.selectedModel}
           selectedEffort={remote.selectedEffort}
           selectedPermissionMode={remote.selectedPermissionMode}
+          permissionModeStatus={remote.permissionModeStatus}
           phase={remote.phase}
           phaseDetail={remote.phaseDetail}
           running={remote.running}

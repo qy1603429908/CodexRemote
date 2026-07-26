@@ -10,6 +10,7 @@ import { PromptQueueStore } from "./prompt-queue.js";
 const config = loadConfig();
 const bridge = new AppServerBridge({
   codexBin: config.codexBin,
+  codexArgs: config.codexArgs,
   env: buildCodexEnvironment(config.codexHome),
   expectedCodexHome: config.codexHome,
 });
@@ -164,4 +165,6 @@ await desktopIpc.start();
 server.listen(config.port, config.host, () => {
   console.log(`[server] listening on http://${config.host}:${config.port}`);
   console.log(`[server] websocket endpoint ws://${config.host}:${config.port}/ws`);
+  if (config.packagedNodeReplRuntime)
+    console.log(`[server] packaged Node REPL runtime ${config.packagedNodeReplRuntime.nodeRepl}`);
 });

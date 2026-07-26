@@ -63,7 +63,7 @@ type JSONRPCNotification = {
     "capabilities": {
       "experimentalApi": true,
       "requestAttestation": false,
-      "mcpServerOpenaiFormElicitation": false,
+      "mcpServerOpenaiFormElicitation": true,
       "optOutNotificationMethods": null
     }
   }
@@ -87,6 +87,8 @@ type InitializeParams = {
   } | null;
 };
 ```
+
+> **Computer Use 必需能力**：Host 必须声明 `mcpServerOpenaiFormElicitation: true`。原生 Computer Use 通过 `node_repl` MCP 发出 `mcpServer/elicitation/request`；若不声明该能力，`nodeRepl.createElicitation` 不可用，工具会在审批前失败。
 
 成功响应：
 
@@ -1365,3 +1367,108 @@ git -C "$TASK_CWD" rev-parse --show-toplevel
 ```
 
 `git` 可以自然解析 cwd 的祖先 worktree；Host 不扫描 cwd 的子目录，也不使用 turn/tool item 中出现过的其他 cwd。命令使用 `execFile` 参数数组、`GIT_OPTIONAL_LOCKS=0`、15 秒超时和 2 MiB 输出上限。非 Git cwd 返回空 `repositoryRoot`，客户端完全隐藏 Git 面板。
+
+
+## 11. Android item 时间来源与 Subagent 行内目标（2026-07-26 实测）
+
+### 11.1 时间来源必须显式区分
+
+Desktop canonical snapshot 中的 `collabAgentToolCall`、命令等历史 item 经常没有 `createdAt`。`turn.startedAt` 只能用于保持 canonical 数组的 turn 级顺序，不能作为每个 item 的展示时间。
+
+Android 内部为消息记录 `timestampSource`：
+
+| 来源 | 含义 | 展示 |
+|---|---|---|
+| `item` | canonical item/`restoreMessage` 自带创建时间 | `HH:mm` |
+| `live` | `item/started.startedAtMs`、`item/completed.completedAtMs` 或本地实时创建 | `HH:mm` |
+| `observed` | 客户端已完成初始快照后，首次在活动 turn snapshot 中看到的新 item | `≈HH:mm` |
+| `turn` | 只有 `turn.startedAt`，仅作顺序回退 | 不展示 |
+
+合并规则：
+
+1. 初次加载整段历史时，不得把加载时刻批量写成历史消息时间。
+2. 在线状态下新出现但无 item 时间的活动 turn item，可记录“首次观察时间”，必须带 `≈`，不能宣称是服务端精确创建时间。
+3. 已经从 `item`、`live` 或 `observed` 得到的时间，不能被后续仅有 `turn` 回退时间的 snapshot 覆盖。
+4. canonical 数组顺序仍是正文顺序的 ground truth；不能按这些时间重新排序同一 turn 的 item。
+
+2026-07-26 Redmi Note 14 Pro+ 现场证据：旧 `collabAgentToolCall` 原先错误显示 turn 开始时间 `12:53`；修复后旧项不显示伪时间，安装后在线新增工具显示 `≈15:38`、`≈15:39`。
+
+### 11.2 Subagent 目标与渲染
+
+目标名称优先读取结构化字段：
+
+```text
+receiverThreads[].thread.id
+receiverThreads[].thread.agentNickname
+receiverThreads[].thread.agentRole
+agentsStates
+```
+
+只有结构化目标缺失时才使用受限兼容回退；不得扫描任意正文 UUID 并把 UUID 作为 Agent 名称。
+
+移动端渲染约束：
+
+- 连续工具调用仍由外层工具组统一折叠；工具组关闭时不挂载内部 Agent 控件。
+- 展开后，Agent 标签只出现在产生该目标的具体工具调用行中。
+- 标签与 `Subagent · sendInput` 等摘要并排，时间仍是独立列。
+- 标签高度 16 CSS px，点击时 `preventDefault + stopPropagation`，只打开对应 Subagent，不切换工具详情。
+- 多目标在同一摘要行横向容纳，不另起一整行撑高长列表。
+## 13. 原生 Computer Use 与 MCP elicitation（2026-07-26 实测）
+
+### 13.1 工具加载
+
+当前 macOS Desktop Bundle 的运行时位于：
+
+```text
+/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl
+/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node
+/Applications/ChatGPT.app/Contents/Resources/cua_node/lib/node_modules
+/Applications/ChatGPT.app/Contents/Resources/codex
+```
+
+旧配置可能仍指向已经不存在的 `/Applications/Codex.app/Contents/Resources/node_repl`。Host 启动 app-server 时会探测当前 ChatGPT/Codex Bundle，并用本次进程的 `-c mcp_servers.node_repl...` 覆盖项修正 command、Node、module directories、Codex CLI 和 Codex home；不修改用户全局 `~/.codex/config.toml`。Windows/Linux 未命中 macOS Bundle 时保持原配置。
+
+### 13.2 审批请求与响应
+
+真实请求：
+
+```json
+{
+  "method": "mcpServer/elicitation/request",
+  "params": {
+    "threadId": "<thread-id>",
+    "turnId": "<turn-id>",
+    "serverName": "node_repl",
+    "message": "Allow Computer Use to use \"System Information\"?",
+    "_meta": {
+      "connector_name": "Computer Use",
+      "persist": ["session", "always"],
+      "tool_params": { "app": "com.apple.SystemProfiler" }
+    }
+  }
+}
+```
+
+一次允许：
+
+```json
+{ "action": "accept", "content": {}, "_meta": null }
+```
+
+本次会话允许：
+
+```json
+{ "action": "accept", "content": {}, "_meta": { "persist": "session" } }
+```
+
+拒绝：
+
+```json
+{ "action": "decline", "content": null, "_meta": null }
+```
+
+`content` 不能塞入 Host 自定义标记；Codex GUI 的原生响应构造器对 accept 使用空对象 `{}`，持久范围只放 `_meta.persist`。
+
+### 13.3 端到端证据
+
+线程 `019f9dc5-ed9f-72d1-8af6-3108eeaf381f` 在 Redmi Note 14 Pro+ 显示 Computer Use 审批；手机批准后，`node_repl.js` 读取 `com.apple.SystemProfiler` 成功，MCP item 为 `completed`，turn 为 `completed`，持续 `59358 ms`，最终回复“读取成功。”。

@@ -14,7 +14,7 @@ interface CodexBackgroundPluginApi {
   start(options: { title?: string; text?: string; threadId?: string; action?: string; serverUrl?: string }): Promise<{ running: boolean }>;
   update(options: { title?: string; text?: string; threadId?: string; action?: string }): Promise<{ running: boolean }>;
   stop(): Promise<{ running: boolean }>;
-  notifyApproval(options: { threadId: string; title?: string; text?: string; action?: string; notificationId?: number }): Promise<void>;
+  notifyApproval(options: { threadId: string; title?: string; text?: string; action?: string; alertKind?: 'approval' | 'input'; notificationId?: number }): Promise<void>;
   notifyCompletion(options: { threadId: string; title?: string; text?: string; action?: string; notificationId?: number }): Promise<void>;
   cancelNotification(options: { notificationId?: number; kind?: string; threadId?: string }): Promise<void>;
   consumePendingAction(): Promise<{ action: BackgroundAction | null }>;

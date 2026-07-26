@@ -40,6 +40,8 @@ final class CodexBackgroundSocket {
     private static final String WIRE_PROTOCOL = "codex-mobile-v1";
     private static final String TOKEN_KEY = "codex.remote.pairing-token";
     private static final long MAX_RECONNECT_MS = 20_000L;
+    private static final long COMPLETION_FALLBACK_DELAY_MS = 900L;
+    private static final long COMPLETION_DEDUPE_MS = 2_500L;
 
     private final Context context;
     private final Handler handler = new Handler(Looper.getMainLooper());
@@ -52,6 +54,9 @@ final class CodexBackgroundSocket {
     private final Map<String, String> desiredAttention = new ConcurrentHashMap<>();
     private final Map<String, String> notifiedAttention = new ConcurrentHashMap<>();
     private final Map<String, Runnable> attentionTimers = new ConcurrentHashMap<>();
+    private final Map<String, String> threadStates = new ConcurrentHashMap<>();
+    private final Map<String, Runnable> completionTimers = new ConcurrentHashMap<>();
+    private final Map<String, Long> lastCompletionAt = new ConcurrentHashMap<>();
     private final CodexApprovalTracker approvalTracker = new CodexApprovalTracker();
     private final Set<String> notifiedApprovalIds = ConcurrentHashMap.newKeySet();
     private final Set<String> knownThreadIds = ConcurrentHashMap.newKeySet();
@@ -136,7 +141,11 @@ final class CodexBackgroundSocket {
             try { manager.cancel(Integer.parseInt(persistedId)); } catch (NumberFormatException ignored) { }
         }
         for (Runnable timer : attentionTimers.values()) handler.removeCallbacks(timer);
+        for (Runnable timer : completionTimers.values()) handler.removeCallbacks(timer);
         attentionTimers.clear();
+        completionTimers.clear();
+        threadStates.clear();
+        lastCompletionAt.clear();
         desiredAttention.clear();
         notifiedAttention.clear();
         notifiedApprovalIds.clear();
@@ -384,14 +393,14 @@ final class CodexBackgroundSocket {
         Object rawStatus = thread.opt("threadRuntimeStatus");
         if (rawStatus == null || rawStatus == JSONObject.NULL) rawStatus = thread.opt("status");
         String state = stateFromStatus(rawStatus);
-        if (!"unknown".equals(state)) updateAttention(threadId, state);
+        observeThreadState(threadId, state);
     }
 
     private void handleEvent(String method, JSONObject params) {
         if (params == null) return;
         String threadId = firstString(params, "threadId", "conversationId");
         if ("thread/status/changed".equals(method)) {
-            updateAttention(threadId, stateFromStatus(params.opt("status")));
+            observeThreadState(threadId, stateFromStatus(params.opt("status")));
         } else if ("turn/completed".equals(method)) {
             handleTurnCompleted(threadId, params.optJSONObject("turn"));
         } else if (("thread/started".equals(method) || "desktop/threadSnapshot".equals(method)) && params.optJSONObject("thread") != null) {
@@ -414,14 +423,23 @@ final class CodexBackgroundSocket {
         if (notifiedApprovalIds.contains(requestId)) return;
 
         String method = approval.optString("method", "");
-        String title = method.contains("fileChange") ? "Codex 等待文件修改确认"
+        String title = method.contains("mcpServer/elicitation") ? "Codex 等待 Computer Use 确认"
+                : method.contains("fileChange") ? "Codex 等待文件修改确认"
                 : method.contains("permissions") ? "Codex 请求额外权限" : "Codex 等待命令确认";
         String text = firstString(approval, "command", "reason", "detail", "title");
         if (text.isEmpty()) text = "打开 App 查看详情并确认。";
-        if (post(notificationId("approval:" + requestId), CodexNotificationChannels.APPROVALS,
+        int id = notificationId("approval:" + requestId);
+        if (!notificationLedger.claimNotification(id, threadId)) {
+            notifiedApprovalIds.add(requestId);
+            notificationLedger.putApproval(requestId, threadId);
+            return;
+        }
+        if (post(id, CodexNotificationChannels.APPROVALS,
                 "approval", threadId, "openApproval", title, text)) {
             notifiedApprovalIds.add(requestId);
             notificationLedger.putApproval(requestId, threadId);
+        } else {
+            notificationLedger.removeNotification(id);
         }
     }
 
@@ -441,8 +459,14 @@ final class CodexBackgroundSocket {
 
     private synchronized void handleTurnCompleted(String threadId, JSONObject turn) {
         if (threadId == null || threadId.isEmpty()) return;
-        clearPendingAttention(threadId);
+        cancelCompletionFallback(threadId);
         String status = turn == null ? "completed" : turn.optString("status", "completed").toLowerCase(Locale.ROOT);
+        threadStates.put(threadId, status.contains("fail") ? "error" : "idle");
+        long now = android.os.SystemClock.elapsedRealtime();
+        Long previousCompletion = lastCompletionAt.get(threadId);
+        if (previousCompletion != null && now - previousCompletion < COMPLETION_DEDUPE_MS) return;
+        lastCompletionAt.put(threadId, now);
+        clearPendingAttention(threadId);
         String title = status.contains("fail") ? "Codex 执行失败"
                 : status.contains("interrupt") ? "Codex 已中断" : "Codex 已完成";
         String eventId = turn == null ? "latest" : firstString(turn, "id", "turnId", "completedAt", "startedAt");
@@ -450,6 +474,48 @@ final class CodexBackgroundSocket {
         String threadTitle = threadTitles.getOrDefault(threadId, "Codex 任务");
         post(notificationId("turn:" + threadId + ":" + eventId), CodexNotificationChannels.COMPLETIONS,
                 "completion", threadId, "openThread", title, threadTitle);
+    }
+
+    private synchronized void observeThreadState(String threadId, String state) {
+        if (threadId == null || threadId.isEmpty() || "unknown".equals(state)) return;
+        String previous = threadStates.put(threadId, state);
+        updateAttention(threadId, state);
+        if (isActiveState(state)) {
+            cancelCompletionFallback(threadId);
+            return;
+        }
+        if (isActiveState(previous) && isTerminalState(state)) scheduleCompletionFallback(threadId, state);
+    }
+
+    private synchronized void scheduleCompletionFallback(String threadId, String state) {
+        cancelCompletionFallback(threadId);
+        Runnable fallback = () -> {
+            synchronized (CodexBackgroundSocket.this) {
+                completionTimers.remove(threadId);
+                if (!state.equals(threadStates.get(threadId)) || !isTerminalState(state)) return;
+                JSONObject syntheticTurn = new JSONObject();
+                try {
+                    syntheticTurn.put("id", "status-" + System.currentTimeMillis());
+                    syntheticTurn.put("status", "error".equals(state) ? "failed" : "completed");
+                } catch (JSONException ignored) { }
+                handleTurnCompleted(threadId, syntheticTurn);
+            }
+        };
+        completionTimers.put(threadId, fallback);
+        handler.postDelayed(fallback, COMPLETION_FALLBACK_DELAY_MS);
+    }
+
+    private synchronized void cancelCompletionFallback(String threadId) {
+        Runnable fallback = completionTimers.remove(threadId);
+        if (fallback != null) handler.removeCallbacks(fallback);
+    }
+
+    private static boolean isActiveState(String state) {
+        return "running".equals(state) || "approval".equals(state) || "input".equals(state);
+    }
+
+    private static boolean isTerminalState(String state) {
+        return "idle".equals(state) || "error".equals(state);
     }
 
     private synchronized void updateAttention(String threadId, String state) {
@@ -479,7 +545,8 @@ final class CodexBackgroundSocket {
                 if ("approval".equals(state) && approvalTracker.hasThread(threadId)) return;
                 String title = "input".equals(state) ? "Codex 等待你的输入" : "Codex 等待审批";
                 String text = threadTitles.getOrDefault(threadId, "Codex 任务") + " · 打开 App 继续处理。";
-                if (post(notificationId("attention:" + state + ":" + threadId), CodexNotificationChannels.APPROVALS,
+                if (post(notificationId("attention:" + state + ":" + threadId),
+                        "input".equals(state) ? CodexNotificationChannels.INPUTS : CodexNotificationChannels.APPROVALS,
                         "approval", threadId, "input".equals(state) ? "openThread" : "openApproval", title, text)) {
                     notifiedAttention.put(threadId, state);
                     notificationLedger.putAttention(threadId, state);
@@ -526,6 +593,9 @@ final class CodexBackgroundSocket {
         clearPendingAttention(threadId);
         knownThreadIds.remove(threadId);
         threadTitles.remove(threadId);
+        threadStates.remove(threadId);
+        lastCompletionAt.remove(threadId);
+        cancelCompletionFallback(threadId);
     }
 
     private void cancelPersistedNotificationsForThread(String threadId) {
@@ -575,18 +645,25 @@ final class CodexBackgroundSocket {
                 .setPriority(NotificationCompat.PRIORITY_HIGH)
                 .setCategory(NotificationCompat.CATEGORY_EVENT)
                 .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
-                .setOnlyAlertOnce(true)
+                .setOnlyAlertOnce(false)
                 .setGroup("codex-thread-" + threadId);
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
             builder.setDefaults(Notification.DEFAULT_SOUND | Notification.DEFAULT_VIBRATE);
         }
         try {
             NotificationManagerCompat.from(context).notify(id, builder.build());
+            CodexNotificationChannels.playVendorAlertFallback(context, alertKindForChannel(channel));
             if ("approval".equals(kind)) notificationLedger.putNotification(id, threadId);
             return true;
         } catch (RuntimeException ignored) {
             return false;
         }
+    }
+
+    private static String alertKindForChannel(String channel) {
+        if (CodexNotificationChannels.APPROVALS.equals(channel)) return "approval";
+        if (CodexNotificationChannels.INPUTS.equals(channel)) return "input";
+        return "completion";
     }
 
     private static String stateFromStatus(Object raw) {

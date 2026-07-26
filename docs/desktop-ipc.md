@@ -298,3 +298,41 @@ Desktop canonical projection:  msg_... / call_... / UUID
 6. 不能按 `createdAt` 或 item ID 排序；很多 item 只有 turn 级时间戳，随机/来源相关 ID 也不具备时序语义。
 
 这组规则专门防止“会话刚打开正常，数秒后旧用户/Codex 正文自行移动到最下面”的二阶段同步回归。
+
+
+## 8. 新任务创建边界（2026-07-26 实测）
+
+当前 Desktop IPC 探测到的是已有 Desktop-owned thread 的 follower、settings、steer、start-turn、interrupt、compact 等能力；没有“在 Desktop GUI 中创建新任务/将外部 thread 注入 GUI 侧边栏”的调用。
+
+因此 Host 的 `thread.start` 走 app-server `thread/start` 创建的任务：
+
+- 会进入 app-server 和手机客户端任务索引；
+- 不保证自动出现在正在运行的 Desktop GUI 侧边栏；
+- 不自动继承 GUI renderer 在 `thread/start` 时注入的 Dynamic Tools；但 Host 现在可通过已配置的 `node_repl` MCP 与随包 Computer Use runtime，为 app-server 任务提供原生 Computer Use。技能文件本身仍不等价于工具，必须同时满足 MCP ready、Node module 路径正确和 `mcpServerOpenaiFormElicitation: true`。
+
+需要同时满足“GUI 可见”和“GUI 插件工具可用”的测试任务，必须从 Desktop GUI 创建；在发现新的 Desktop IPC create-thread 接口前，Host 不能把 app-server 新任务伪装成 GUI 新任务。
+## 9. Computer Use 审批 follower 回传（2026-07-26 实测）
+
+Desktop GUI 对已有 GUI-owned thread 的原生 MCP 审批使用：
+
+```text
+thread-follower-submit-mcp-server-elicitation-response
+```
+
+参数精确为：
+
+```json
+{
+  "conversationId": "<thread-id>",
+  "requestId": "<original-request-id>",
+  "response": {
+    "action": "accept",
+    "content": {},
+    "_meta": null
+  }
+}
+```
+
+Desktop host 最终调用 `replyWithMcpServerElicitationResponse(conversationId, requestId, response)`。因此手机客户端跟随 GUI-owned thread 时，不应直接向第二个 app-server 进程伪造响应，而应走 follower IPC 交回原 owner。
+
+该接口仍然只处理已有 GUI-owned thread；没有发现 follower IPC 创建 GUI 任务或把外部 app-server thread 注入 GUI 侧边栏的接口。

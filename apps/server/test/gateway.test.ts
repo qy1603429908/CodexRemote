@@ -487,8 +487,62 @@ describe("MobileGateway", () => {
     bridge.emit("serverRequest", { id: 42, method: "item/commandExecution/requestApproval", params: { command: "echo hi", cwd: "/tmp" } });
     await waitFor(() => messages.some((message) => message.type === "approval"));
     ws.send(JSON.stringify({ type: "approval.resolve", approvalRequestId: 42, decision: "accept" }));
+    await waitFor(() => bridge.responses.length === 1);
+    bridge.emit("notification", { method: "serverRequest/resolved", params: { requestId: 42 } });
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(bridge.responses).toEqual([{ id: 42, result: { decision: "accept" } }]);
+    expect(messages.filter((message) =>
+      message.type === "approval.resolved" && message.approvalRequestId === 42
+    )).toHaveLength(1);
+    ws.close();
+  });
+
+  it("routes native Computer Use MCP elicitations through the phone approval flow", async () => {
+    const { bridge, port } = await start();
+    const encoded = Buffer.from(token).toString("base64url");
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`, ["codex-mobile-v1", `token.${encoded}`], { origin: "capacitor://localhost" });
+    const messages: Array<Record<string, unknown>> = [];
+    ws.on("message", (data) => messages.push(JSON.parse(data.toString())));
+    await new Promise<void>((resolve, reject) => { ws.once("open", resolve); ws.once("error", reject); });
+    const elicitation = {
+      id: 47,
+      method: "mcpServer/elicitation/request",
+      params: {
+        threadId: "t1",
+        turnId: "turn1",
+        serverName: "node_repl",
+        message: 'Allow Computer Use to use "Finder"?',
+        _meta: {
+          connector_name: "Computer Use",
+          persist: ["session", "always"],
+          tool_params: { app: "com.apple.finder" },
+        },
+      },
+    };
+    bridge.emit("serverRequest", elicitation);
+    bridge.emit("serverRequest", elicitation);
+    await waitFor(() => messages.some((message) => message.type === "approval"));
+    expect(messages.filter((message) => message.type === "approval")).toHaveLength(1);
+    const approval = messages.find((message) => message.type === "approval")?.approval as {
+      title: string;
+      detail: string;
+      availableDecisions: unknown[];
+    };
+    expect(approval).toMatchObject({
+      title: "允许 Computer Use 操作？",
+      detail: 'Allow Computer Use to use "Finder"?',
+    });
+    expect(approval.availableDecisions).toEqual(["decline", "accept", "acceptForSession"]);
+    ws.send(JSON.stringify({ type: "approval.resolve", approvalRequestId: 47, decision: "acceptForSession" }));
+    await waitFor(() => bridge.responses.length === 1);
+    expect(bridge.responses).toEqual([{
+      id: 47,
+      result: {
+        action: "accept",
+        content: {},
+        _meta: { persist: "session" },
+      },
+    }]);
     ws.close();
   });
   it("keeps Desktop approvals pending when only app-server goes offline", async () => {

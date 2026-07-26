@@ -57,7 +57,7 @@ describe('conversation horizontal overflow constraints', () => {
 
     const messageMeta = declarations('.message-detail-card > summary .message-meta');
     expect(messageMeta).toMatch(/min-width:\s*0/);
-    expect(messageMeta).toMatch(/max-width:\s*45%/);
+    expect(messageMeta).not.toMatch(/max-width:\s*45%/);
 
     expect(declarations('.markdown-content a')).toMatch(/overflow-wrap:\s*anywhere/);
     expect(declarations('.markdown-content code')).toMatch(/word-break:\s*break-word/);
@@ -88,12 +88,31 @@ describe('conversation horizontal overflow constraints', () => {
 });
 
 
+describe('Running task permission controls', () => {
+  it('keeps permission/review selection enabled while a task is running and exposes inline status', () => {
+    expect(conversationSource).toMatch(/selectedPermissionMode[\s\S]*disabled=\{phase !== 'connected'\}/);
+    expect(conversationSource).not.toMatch(/onSelectPermissionMode[\s\S]{0,500}disabled=\{phase !== 'connected' \|\| running\}/);
+    expect(conversationSource).toContain('permission-mode-status');
+    expect(appSource).toContain('permissionModeStatus={remote.permissionModeStatus}');
+    expect(declarations('.permission-mode-status')).toMatch(/grid-column:\s*1 \/ -1/);
+  });
+});
+
 describe('Mobile long-list rendering', () => {
-  it('does not mount collapsed tool-group message bodies and keeps Subagent links in the summary block', () => {
+  it('mounts no Subagent controls for collapsed tool groups and uses compact per-tool controls after expansion', () => {
     expect(conversationSource).toMatch(/expandedToolGroupIds\.has\(entry\.id\)\s*&&\s*\(/);
-    expect(conversationSource).toMatch(/tool-group-agent-links/);
-    expect(conversationSource).toMatch(/tool-group-summary-agent/);
-    expect(conversationSource).toMatch(/event\.preventDefault\(\);[\s\S]*event\.stopPropagation\(\);[\s\S]*onOpenThread\(agent\.id\)/);
+    expect(conversationSource).not.toMatch(/tool-group-agent-links|tool-group-summary-agent|tool-group-agent-more/);
+    expect(messageBubbleSource).toMatch(/className="event-summary"[\s\S]*className="message-agent-actions"[\s\S]*className="message-agent-button"[\s\S]*event\.preventDefault\(\);[\s\S]*event\.stopPropagation\(\);[\s\S]*onOpenAgent\?\.\(agent\.id\)/);
+    expect(messageBubbleSource).toMatch(/className="message-agent-actions"[\s\S]*<\/span>\s*\)}\s*<\/span>\s*<span className="message-meta">/);
+    const actionRow = declarations('.message-agent-actions');
+    expect(actionRow).toMatch(/display:\s*inline-flex/);
+    expect(actionRow).toMatch(/max-width:\s*46%/);
+    expect(actionRow).toMatch(/overflow-x:\s*auto/);
+    expect(messageBubbleSource).toMatch(/isSubagent[\s\S]*agentTargets\.length > 0 \? '' : '查看 Subagent 活动'/);
+    const compactButton = declarations('.message-agent-button');
+    expect(compactButton).toMatch(/min-height:\s*16px/);
+    expect(compactButton).toMatch(/border-radius:\s*4px/);
+    expect(compactButton).toMatch(/padding:\s*1px 4px/);
     expect(conversationSource).not.toMatch(/const \[now, setNow\] = useState/);
   });
 

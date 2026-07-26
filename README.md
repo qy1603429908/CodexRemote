@@ -112,7 +112,7 @@ npm run build:android
 本地产物：
 
 ```text
-apps/mobile/artifacts/codex-mobile-remote-v0.3.5-debug.apk
+apps/mobile/artifacts/codex-mobile-remote-v0.3.7-debug.apk
 ```
 
 正式交付 APK 发布在 Gitea Releases，不提交进源码 Git。
@@ -120,10 +120,10 @@ apps/mobile/artifacts/codex-mobile-remote-v0.3.5-debug.apk
 安装：
 
 ```bash
-adb install -r apps/mobile/artifacts/codex-mobile-remote-v0.3.5-debug.apk
+adb install -r apps/mobile/artifacts/codex-mobile-remote-v0.3.7-debug.apk
 ```
 
-这是 `versionName=0.3.5`、`versionCode=9` 的 debug 签名侧载包，不是应用商店正式签名包。
+这是 `versionName=0.3.7`、`versionCode=11` 的 debug 签名侧载包，不是应用商店正式签名包。
 
 ## 开发与验证
 

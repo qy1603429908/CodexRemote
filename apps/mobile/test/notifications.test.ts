@@ -42,6 +42,7 @@ vi.mock('../src/lib/background', () => ({
 }));
 
 import {
+  cancelThreadAttentionNotification,
   initializeNotifications,
   notifyApprovalRequested,
   notifyThreadAttention,
@@ -64,7 +65,7 @@ beforeEach(() => {
 });
 
 describe('Android notification initialization', () => {
-  it('shares an in-flight permission request and creates audible v2 channels', async () => {
+  it('shares an in-flight permission request and creates three differentiated audible channels', async () => {
     let resolvePermission: (value: { display: string }) => void = () => undefined;
     mocks.checkPermissions.mockReturnValue(new Promise((resolve) => { resolvePermission = resolve; }));
 
@@ -74,12 +75,15 @@ describe('Android notification initialization', () => {
 
     await expect(Promise.all([first, second])).resolves.toEqual([true, true]);
     expect(mocks.checkPermissions).toHaveBeenCalledTimes(1);
-    expect(mocks.createChannel).toHaveBeenCalledTimes(2);
+    expect(mocks.createChannel).toHaveBeenCalledTimes(3);
     expect(mocks.createChannel).toHaveBeenCalledWith(expect.objectContaining({
-      id: 'codex_completions_v2', importance: 5, sound: 'codex_notification.wav', vibration: true,
+      id: 'codex_completions_v4', importance: 5, sound: 'codex_completion.wav', vibration: true,
     }));
     expect(mocks.createChannel).toHaveBeenCalledWith(expect.objectContaining({
-      id: 'codex_approvals_v2', importance: 5, sound: 'codex_notification.wav', vibration: true,
+      id: 'codex_approvals_v4', importance: 5, sound: 'codex_approval.wav', vibration: true,
+    }));
+    expect(mocks.createChannel).toHaveBeenCalledWith(expect.objectContaining({
+      id: 'codex_inputs_v1', importance: 5, sound: 'codex_input.wav', vibration: true,
     }));
   });
 
@@ -109,8 +113,24 @@ describe('Android task and attention alerts', () => {
       threadId: 'thread-2', threadTitle: 'Review', status: 'failed',
     })).resolves.toBe(true);
     expect(mocks.schedule).toHaveBeenCalledWith({ notifications: [expect.objectContaining({
-      channelId: 'codex_completions_v2', sound: 'codex_notification.wav', title: 'Codex 执行失败',
+      channelId: 'codex_completions_v4', sound: 'codex_completion.wav', title: 'Codex 执行失败',
     })] });
+  });
+
+  it('does not invoke the Capacitor fallback when native cancellation succeeds', async () => {
+    await expect(cancelThreadAttentionNotification('thread-native', 'approval')).resolves.toBeUndefined();
+    expect(mocks.cancelNotification).toHaveBeenCalledTimes(1);
+    expect(mocks.cancel).not.toHaveBeenCalled();
+    expect(mocks.getDeliveredNotifications).not.toHaveBeenCalled();
+  });
+
+  it('uses the Capacitor fallback only when native cancellation fails', async () => {
+    mocks.cancelNotification.mockRejectedValueOnce(new Error('native unavailable'));
+    mocks.getDeliveredNotifications.mockResolvedValueOnce({ notifications: [{ id: 123 }, { id: 456 }] });
+
+    await expect(cancelThreadAttentionNotification('thread-fallback', 'input')).resolves.toBeUndefined();
+    expect(mocks.cancel).toHaveBeenCalledTimes(1);
+    expect(mocks.getDeliveredNotifications).toHaveBeenCalledTimes(1);
   });
 
   it('posts explicit approvals and waiting-for-input state as urgent alerts', async () => {
@@ -120,42 +140,59 @@ describe('Android task and attention alerts', () => {
     await expect(notifyThreadAttention({
       threadId: 'thread-3', threadTitle: 'Windows audit', kind: 'input',
     })).resolves.toBe(true);
+    await expect(notifyApprovalRequested({
+      requestId: 'computer-use-1', threadId: 'thread-3', method: 'mcpServer/elicitation/request', detail: 'Allow Computer Use?',
+    })).resolves.toBe(true);
 
-    expect(mocks.notifyApproval).toHaveBeenCalledTimes(2);
+    expect(mocks.notifyApproval).toHaveBeenCalledTimes(3);
     expect(mocks.notifyApproval).toHaveBeenNthCalledWith(1, expect.objectContaining({
       threadId: 'thread-3', title: 'Codex 请求额外权限', action: 'openApproval',
     }));
     expect(mocks.notifyApproval).toHaveBeenNthCalledWith(2, expect.objectContaining({
-      threadId: 'thread-3', title: 'Codex 等待你的输入', action: 'openThread',
+      threadId: 'thread-3', title: 'Codex 等待你的输入', action: 'openThread', alertKind: 'input',
+    }));
+    expect(mocks.notifyApproval).toHaveBeenNthCalledWith(3, expect.objectContaining({
+      threadId: 'thread-3', title: 'Codex 等待 Computer Use 确认', action: 'openApproval',
     }));
   });
 });
 
 
 describe('packaged Android notification channels', () => {
-  it('uses matching immutable v2 channel IDs and the bundled alert sound natively', () => {
+  it('uses immutable differentiated channel IDs and bundled alert sounds natively', () => {
     const source = readFileSync(resolve(
       process.cwd(),
       'android/app/src/main/java/dev/codexmobile/remote/CodexNotificationChannels.java',
     ), 'utf8');
 
-    expect(source).toContain('codex_approvals_v2');
-    expect(source).toContain('codex_completions_v2');
-    expect(source.match(/NotificationManager\.IMPORTANCE_HIGH/g)).toHaveLength(2);
-    expect(source.match(/R\.raw\.codex_notification/g)).toHaveLength(1);
-    expect(source.match(/\.setSound\(alertSound, alertAudio\)/g)).toHaveLength(2);
+    expect(source).toContain('codex_approvals_v4');
+    expect(source).toContain('codex_inputs_v1');
+    expect(source).toContain('codex_completions_v4');
+    expect(source.match(/NotificationManager\.IMPORTANCE_HIGH/g)).toHaveLength(3);
+    expect(source).toContain('R.raw.codex_approval');
+    expect(source).toContain('R.raw.codex_input');
+    expect(source).toContain('R.raw.codex_completion');
+    expect(source.match(/\.setSound\(rawSoundUri\(context, R\.raw\./g)).toHaveLength(3);
     expect(source).toContain('AudioAttributes.USAGE_NOTIFICATION_EVENT');
+    expect(source).toContain('Build.VERSION_CODES.UPSIDE_DOWN_CAKE');
+    expect(source).toContain('new MediaPlayer()');
+    expect(source).toContain('AudioManager.RINGER_MODE_NORMAL');
+    expect(source).toContain('NotificationManager.INTERRUPTION_FILTER_NONE');
+    expect(source).toContain('openRawResourceFd(soundResource)');
   });
 
-  it('packages a valid WAV resource for Android notification sound', () => {
-    const sound = readFileSync(resolve(
+  it('packages three valid and distinct WAV resources for Android alert types', () => {
+    const sounds = ['codex_approval.wav', 'codex_input.wav', 'codex_completion.wav'].map((name) => readFileSync(resolve(
       process.cwd(),
-      'android/app/src/main/res/raw/codex_notification.wav',
-    ));
+      `android/app/src/main/res/raw/${name}`,
+    )));
 
-    expect(sound.byteLength).toBeGreaterThan(44);
-    expect(sound.subarray(0, 4).toString('ascii')).toBe('RIFF');
-    expect(sound.subarray(8, 12).toString('ascii')).toBe('WAVE');
+    for (const sound of sounds) {
+      expect(sound.byteLength).toBeGreaterThan(44);
+      expect(sound.subarray(0, 4).toString('ascii')).toBe('RIFF');
+      expect(sound.subarray(8, 12).toString('ascii')).toBe('WAVE');
+    }
+    expect(new Set(sounds.map((sound) => sound.toString('base64'))).size).toBe(3);
   });
 });
 
@@ -168,6 +205,12 @@ describe('notification state reconciliation wiring', () => {
     expect(useRemoteSource).toMatch(/case 'threads\.delta':[\s\S]*replaceThreadsAndSyncAttention/);
     expect(useRemoteSource).toMatch(/case 'thread':[\s\S]*replaceThreadsAndSyncAttention/);
     expect(useRemoteSource).toMatch(/desktop\/threadSnapshot[\s\S]*replaceThreadsAndSyncAttention/);
+  });
+
+  it('skips native cancellation for ordinary non-waiting snapshot entries', () => {
+    expect(useRemoteSource).toMatch(/previousState === undefined && notifiedState === undefined && pendingTimer === undefined\) return/);
+    expect(useRemoteSource).toMatch(/if \(waiting \|\| tracked\) updateAttentionNotification/);
+    expect(useRemoteSource).not.toMatch(/queueAttentionCancellation\(threadId, 'approval'\);\s*void queueAttentionCancellation\(threadId, 'input'\)/);
   });
 
   it('keeps pending states retryable and gives every approval request its own alert', () => {
@@ -191,6 +234,10 @@ describe('native foreground-service event listener', () => {
   const pluginSource = readFileSync(resolve(
     process.cwd(),
     'android/app/src/main/java/dev/codexmobile/remote/CodexBackgroundPlugin.java',
+  ), 'utf8');
+  const channelSource = readFileSync(resolve(
+    process.cwd(),
+    'android/app/src/main/java/dev/codexmobile/remote/CodexNotificationChannels.java',
   ), 'utf8');
   const bridgeSource = readFileSync(resolve(process.cwd(), 'src/lib/background.ts'), 'utf8');
   const appSource = readFileSync(resolve(process.cwd(), 'src/App.tsx'), 'utf8');
@@ -230,9 +277,18 @@ describe('native foreground-service event listener', () => {
     expect(socketSource).toContain('waitingOnUserInput');
     expect(socketSource).toContain('waitingOnApproval');
     expect(socketSource).toContain('notificationId("approval:" + requestId)');
+    expect(socketSource).toContain('notificationLedger.claimNotification(id, threadId)');
+    expect(pluginSource).toContain('ledger.claimNotification(id, threadId)');
     expect(socketSource).toContain('notificationId("turn:" + threadId + ":" + eventId)');
     expect(socketSource).toContain('notificationId("attention:" + state + ":" + threadId)');
-    expect(socketSource).toContain('.setOnlyAlertOnce(true)');
+    expect(socketSource).toContain('.setOnlyAlertOnce(false)');
+    expect(socketSource).toContain('CodexNotificationChannels.playVendorAlertFallback(context, alertKindForChannel(channel))');
+    expect(pluginSource).toContain('CodexNotificationChannels.playVendorAlertFallback(getContext(), alertKindForChannel(channel))');
+    expect(socketSource).toContain('observeThreadState(threadId, state)');
+    expect(socketSource).toContain('scheduleCompletionFallback(threadId, state)');
+    expect(socketSource).toContain('COMPLETION_FALLBACK_DELAY_MS = 900L');
+    expect(channelSource).toContain('ALERT_DEDUPE_MS = 900L');
+    expect(channelSource).toContain('fallback deduped kind=');
   });
 });
 

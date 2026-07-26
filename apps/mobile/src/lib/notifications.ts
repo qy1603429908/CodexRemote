@@ -3,9 +3,12 @@ import { CodexBackground } from './background';
 import { LocalNotifications } from '@capacitor/local-notifications';
 import type { WireApprovalRequest } from '../types/protocol';
 
-const COMPLETION_CHANNEL = 'codex_completions_v2';
-const APPROVAL_CHANNEL = 'codex_approvals_v2';
-const ALERT_SOUND = 'codex_notification.wav';
+const COMPLETION_CHANNEL = 'codex_completions_v4';
+const APPROVAL_CHANNEL = 'codex_approvals_v4';
+const INPUT_CHANNEL = 'codex_inputs_v1';
+const COMPLETION_SOUND = 'codex_completion.wav';
+const APPROVAL_SOUND = 'codex_approval.wav';
+const INPUT_SOUND = 'codex_input.wav';
 let initializationPromise: Promise<boolean> | null = null;
 
 function notificationId(value: string): number {
@@ -32,16 +35,25 @@ export async function initializeNotifications(): Promise<boolean> {
         importance: 5,
         visibility: 1,
         vibration: true,
-        sound: ALERT_SOUND,
+        sound: COMPLETION_SOUND,
       });
       await LocalNotifications.createChannel({
         id: APPROVAL_CHANNEL,
-        name: 'Codex 等待确认',
-        description: '命令、文件、权限审批和等待输入通知',
+        name: 'Codex 等待审批',
+        description: '命令、文件和权限审批通知',
         importance: 5,
         visibility: 1,
         vibration: true,
-        sound: ALERT_SOUND,
+        sound: APPROVAL_SOUND,
+      });
+      await LocalNotifications.createChannel({
+        id: INPUT_CHANNEL,
+        name: 'Codex 等待输入',
+        description: '任务等待用户补充输入的通知',
+        importance: 5,
+        visibility: 1,
+        vibration: true,
+        sound: INPUT_SOUND,
       });
       return true;
     } catch {
@@ -90,7 +102,7 @@ export async function notifyTurnFinished(options: {
         title,
         body: `${options.threadTitle}${duration}`,
         channelId: COMPLETION_CHANNEL,
-        sound: ALERT_SOUND,
+        sound: COMPLETION_SOUND,
         extra: { type: 'turn', threadId: options.threadId },
       }],
     });
@@ -129,7 +141,7 @@ export async function notifyCompactionFailed(options: {
         body,
         largeBody: options.message,
         channelId: COMPLETION_CHANNEL,
-        sound: ALERT_SOUND,
+        sound: COMPLETION_SOUND,
         extra: { type: 'compaction-failed', threadId: options.threadId },
       }],
     });
@@ -141,11 +153,13 @@ export async function notifyCompactionFailed(options: {
 
 export async function notifyApprovalRequested(approval: WireApprovalRequest): Promise<boolean> {
   if (!(await initializeNotifications())) return false;
-  const title = approval.method.includes('fileChange')
-    ? 'Codex 等待文件修改确认'
-    : approval.method.includes('permissions')
-      ? 'Codex 请求额外权限'
-      : 'Codex 等待命令确认';
+  const title = approval.method.includes('mcpServer/elicitation')
+    ? 'Codex 等待 Computer Use 确认'
+    : approval.method.includes('fileChange')
+      ? 'Codex 等待文件修改确认'
+      : approval.method.includes('permissions')
+        ? 'Codex 请求额外权限'
+        : 'Codex 等待命令确认';
   const body = approval.command || approval.reason || approval.detail || '打开 App 查看详情并确认。';
   const id = notificationId(`approval:${String(approval.requestId)}`);
   if (Capacitor.isNativePlatform()) {
@@ -170,7 +184,7 @@ export async function notifyApprovalRequested(approval: WireApprovalRequest): Pr
         body,
         largeBody: approval.detail || approval.command,
         channelId: APPROVAL_CHANNEL,
-        sound: ALERT_SOUND,
+        sound: APPROVAL_SOUND,
         extra: { type: 'approval', requestId: String(approval.requestId), threadId: approval.threadId },
       }],
     });
@@ -196,6 +210,7 @@ export async function notifyThreadAttention(options: {
         title,
         text: body,
         action: options.kind === 'input' ? 'openThread' : 'openApproval',
+        alertKind: options.kind,
         notificationId: id,
       });
       return true;
@@ -209,8 +224,8 @@ export async function notifyThreadAttention(options: {
         id,
         title,
         body,
-        channelId: APPROVAL_CHANNEL,
-        sound: ALERT_SOUND,
+        channelId: options.kind === 'input' ? INPUT_CHANNEL : APPROVAL_CHANNEL,
+        sound: options.kind === 'input' ? INPUT_SOUND : APPROVAL_SOUND,
         extra: { type: `attention-${options.kind}`, threadId: options.threadId },
       }],
     });
@@ -232,8 +247,9 @@ async function cancelNotificationById(id: number): Promise<void> {
   if (!Capacitor.isNativePlatform()) return;
   try {
     await CodexBackground.cancelNotification({ notificationId: id });
+    return;
   } catch {
-    // Continue with the LocalNotifications fallback.
+    // Continue with the LocalNotifications fallback only when the native path failed.
   }
   try {
     await LocalNotifications.cancel({ notifications: [{ id }] });

@@ -66,6 +66,10 @@ export function compactCache(snapshot: RemoteCacheSnapshot): RemoteCacheSnapshot
   for (const [threadId, messages] of Object.entries(sanitized.messagesByThread)) {
     if (!allowed.has(threadId)) continue;
     messagesByThread[threadId] = messages
+      // Reasoning shown in TransientActivity is turn-scoped live state. Persisting a
+      // streaming summary lets a long-running task revive hours-old activity after an
+      // app restart before the fresh snapshot arrives.
+      .filter((message) => !(message.status === 'streaming' && message.itemType?.toLowerCase().includes('reasoning')))
       .slice(-MAX_MESSAGES_PER_THREAD)
       .map(({ detail: _detail, ...message }) => message);
   }

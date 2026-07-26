@@ -1,6 +1,7 @@
 package dev.codexmobile.remote;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
 import org.junit.Test;
@@ -27,6 +28,22 @@ public class CodexNotificationLedgerTest {
     public void corruptOrEmptyLedgerDoesNotBlockServiceRecovery() {
         assertTrue(CodexNotificationLedger.decodeMap("").isEmpty());
         assertTrue(CodexNotificationLedger.decodeMap("not-json").isEmpty());
+    }
+
+    @Test
+    public void notificationClaimIsSharedAcrossForegroundAndBackgroundLedgerInstances() {
+        android.content.Context context = androidx.test.core.app.ApplicationProvider.getApplicationContext();
+        CodexNotificationLedger foreground = new CodexNotificationLedger(context);
+        CodexNotificationLedger background = new CodexNotificationLedger(context);
+        foreground.clear();
+
+        assertTrue(background.claimNotification(123, "thread-a"));
+        assertFalse(foreground.claimNotification(123, "thread-a"));
+        assertEquals(Map.of("123", "thread-a"), foreground.notificationIds());
+
+        foreground.removeNotification(123);
+        assertTrue(foreground.claimNotification(123, "thread-a"));
+        foreground.clear();
     }
 
     @Test

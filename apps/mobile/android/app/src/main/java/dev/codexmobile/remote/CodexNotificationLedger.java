@@ -12,6 +12,7 @@ import java.util.Map;
 
 /** Minimal durable index used to reconcile notifications after the Service process restarts. */
 final class CodexNotificationLedger {
+    private static final Object NOTIFICATION_LOCK = new Object();
     private static final String PREFS = "codex_background_notification_ledger_v1";
     private static final String KEY_APPROVALS = "approvals";
     private static final String KEY_ATTENTION = "attention";
@@ -66,16 +67,31 @@ final class CodexNotificationLedger {
         if (values.remove(threadId) != null) preferences.edit().putString(KEY_ATTENTION, encodeMap(values)).commit();
     }
 
-    synchronized void putNotification(int notificationId, String threadId) {
-        Map<String, String> values = notificationIds();
-        values.put(String.valueOf(notificationId), threadId);
-        preferences.edit().putString(KEY_NOTIFICATION_IDS, encodeMap(values)).commit();
+    void putNotification(int notificationId, String threadId) {
+        synchronized (NOTIFICATION_LOCK) {
+            Map<String, String> values = notificationIds();
+            values.put(String.valueOf(notificationId), threadId);
+            preferences.edit().putString(KEY_NOTIFICATION_IDS, encodeMap(values)).commit();
+        }
     }
 
-    synchronized void removeNotification(int notificationId) {
-        Map<String, String> values = notificationIds();
-        if (values.remove(String.valueOf(notificationId)) != null) {
+    boolean claimNotification(int notificationId, String threadId) {
+        synchronized (NOTIFICATION_LOCK) {
+            Map<String, String> values = notificationIds();
+            String key = String.valueOf(notificationId);
+            if (values.containsKey(key)) return false;
+            values.put(key, threadId);
             preferences.edit().putString(KEY_NOTIFICATION_IDS, encodeMap(values)).commit();
+            return true;
+        }
+    }
+
+    void removeNotification(int notificationId) {
+        synchronized (NOTIFICATION_LOCK) {
+            Map<String, String> values = notificationIds();
+            if (values.remove(String.valueOf(notificationId)) != null) {
+                preferences.edit().putString(KEY_NOTIFICATION_IDS, encodeMap(values)).commit();
+            }
         }
     }
 

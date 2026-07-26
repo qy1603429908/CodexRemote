@@ -3,11 +3,12 @@ import type { RemoteAttachment, RemoteMessage } from '../types/protocol';
 import { DiffView } from './DiffView';
 import { Markdown } from './Markdown';
 
-function displayTime(timestamp: number): string {
-  if (!timestamp || timestamp <= 0) return '';
+export function displayTime(timestamp: number, source?: RemoteMessage['timestampSource']): string {
+  if (!source || source === 'turn' || !timestamp || timestamp <= 0) return '';
   const date = new Date(timestamp);
   if (Number.isNaN(date.getTime())) return '';
-  return new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit' }).format(date);
+  const formatted = new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit' }).format(date);
+  return source === 'observed' ? `≈${formatted}` : formatted;
 }
 
 function formatDuration(durationMs?: number): string {
@@ -130,6 +131,7 @@ export function messageBubblePropsEqual(previous: MessageBubbleProps, next: Mess
   const messageEqual = left === right || (
     left.id === right.id && left.role === right.role && left.content === right.content
     && left.status === right.status && left.createdAt === right.createdAt
+    && left.timestampSource === right.timestampSource
     && left.completedAt === right.completedAt && left.durationMs === right.durationMs
     && left.itemType === right.itemType && left.toolName === right.toolName
     && left.collapsible === right.collapsible && left.detail === right.detail
@@ -158,6 +160,9 @@ export const MessageBubble = memo(function MessageBubble({ message, agentTargets
   const duration = formatDuration(message.durationMs);
   const isDiff = message.toolName === '本轮 Diff' || /^diff --git /m.test(message.content);
   const inspectable = message.collapsible || isTool || isSubagent;
+  const eventPreview = isSubagent
+    ? (agentTargets.length > 0 ? '' : '查看 Subagent 活动')
+    : (firstLine(message.content) || '查看详情');
   const body = () => <>
     {isDiff
       ? <DiffView diff={message.content} />
@@ -178,15 +183,35 @@ export const MessageBubble = memo(function MessageBubble({ message, agentTargets
           >
             <summary>
               <span className="event-disclosure" aria-hidden="true">›</span>
-              <span className="event-kind">{isSubagent ? 'Subagent' : isDiff ? 'Diff' : '工具'}</span>
+              <span className="event-kind">{isSubagent ? 'Agent' : isDiff ? 'Diff' : '工具'}</span>
               <span className="event-summary">
                 <strong>{author}</strong>
-                <small>{firstLine(message.content) || '查看详情'}</small>
+                {eventPreview && <small>{eventPreview}</small>}
+                {agentTargets.length > 0 && (
+                  <span className="message-agent-actions" aria-label="此工具调用关联的 Subagent">
+                    {agentTargets.map((agent) => (
+                      <button
+                        className="message-agent-button"
+                        key={agent.id}
+                        type="button"
+                        title={`打开 ${agent.label}`}
+                        onClick={(event) => {
+                          event.preventDefault();
+                          event.stopPropagation();
+                          onOpenAgent?.(agent.id);
+                        }}
+                      >
+                        <span className="message-agent-dot" aria-hidden="true" />
+                        <strong>{agent.label}</strong>
+                      </button>
+                    ))}
+                  </span>
+                )}
               </span>
               <span className="message-meta">
                 {duration && <span>{duration}</span>}
                 {message.status === 'failed' && <span className="failed-label">失败</span>}
-                <time>{displayTime(message.createdAt)}</time>
+                <time>{displayTime(message.createdAt, message.timestampSource)}</time>
               </span>
             </summary>
             {detailsOpen && <div className="message-detail-content">{body()}</div>}
@@ -198,7 +223,7 @@ export const MessageBubble = memo(function MessageBubble({ message, agentTargets
             <header className="message-label">
               <strong>{author}</strong>
               <span className="message-meta">
-                <time>{displayTime(message.createdAt)}</time>
+                <time>{displayTime(message.createdAt, message.timestampSource)}</time>
                 {duration && <span>{duration}</span>}
                 {message.status === 'failed' && <span className="failed-label">失败</span>}
               </span>
@@ -208,17 +233,6 @@ export const MessageBubble = memo(function MessageBubble({ message, agentTargets
               {message.status === 'streaming' && <span className="typing-caret" />}
             </div>
           </>
-        )}
-        {agentTargets.length > 0 && (
-          <nav className="message-agent-links" aria-label="此工具调用关联的 Subagent">
-            {agentTargets.map((agent) => (
-              <button key={agent.id} type="button" onClick={() => onOpenAgent?.(agent.id)}>
-                <span aria-hidden="true" />
-                <strong>{agent.label}</strong>
-                <small>打开</small>
-              </button>
-            ))}
-          </nav>
         )}
       </div>
     </article>

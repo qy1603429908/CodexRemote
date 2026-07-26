@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { agentStatePresentation, conversationEntryWindow, DEFAULT_RENDERED_ENTRY_LIMIT, groupConsecutiveToolMessages, subagentsFromMessages, visibleConversationContentKey } from '../src/components/ConversationScreen';
+import { agentStatePresentation, conversationEntryWindow, DEFAULT_RENDERED_ENTRY_LIMIT, groupConsecutiveToolMessages, resolveConversationEntryAgentNames, subagentsFromMessages, visibleConversationContentKey } from '../src/components/ConversationScreen';
 import { latestReasoning } from '../src/components/ConversationContextPanel';
-import type { RemoteMessage } from '../src/types/protocol';
+import type { RemoteMessage, RemoteThread } from '../src/types/protocol';
 
 function collab(detail: Record<string, unknown>): RemoteMessage {
   return {
@@ -49,6 +49,64 @@ describe('Subagent presentation', () => {
     }]);
     const prompt = { ...cached, itemType: 'collabAgentToolCall', toolName: 'Subagent · spawnAgent' };
     expect(subagentsFromMessages([prompt])).toEqual([]);
+  });
+
+  it('reads wait-agent names from structured receiverThreads and ignores UUID examples in the report body', () => {
+    const targetId = '019f9c86-c712-7be1-8699-597617b734bb';
+    const unrelatedId = '019f99bb-d520-7431-83cc-6636fdcf61b3';
+    const wait = collab({
+      receiverThreadIds: [targetId],
+      receiverThreads: [{
+        threadId: targetId,
+        thread: {
+          id: targetId,
+          agentNickname: 'Singer',
+          name: '审计 Android 通知无声音',
+          status: { type: 'idle' },
+        },
+      }],
+      agentsStates: { [targetId]: { status: 'completed' } },
+    });
+    wait.toolName = 'Subagent · wait';
+    wait.content = `Agent: ${targetId}\n${targetId}: completed — 报告示例：\nAgent: ${unrelatedId}`;
+    expect(subagentsFromMessages([wait])).toEqual([{
+      id: targetId,
+      label: 'Singer',
+      state: 'completed',
+    }]);
+  });
+
+  it('reads a wait-agent nickname from nested source metadata when the thread field has no direct nickname', () => {
+    const targetId = '019f9c86-fc9e-7253-936d-43c5d01fbdba';
+    const wait = collab({
+      receiverThreads: [{
+        threadId: targetId,
+        thread: {
+          id: targetId,
+          source: { subAgent: { thread_spawn: { agent_nickname: 'Lorentz' } } },
+          status: { type: 'active' },
+        },
+      }],
+    });
+    wait.toolName = 'Subagent · wait';
+    expect(subagentsFromMessages([wait])).toEqual([{
+      id: targetId,
+      label: 'Lorentz',
+      state: 'active',
+    }]);
+  });
+
+  it('resolves opaque ids to live agent nicknames and hides unresolved identifiers', () => {
+    const cached = collab({ receiverThreadIds: ['019f99bb-d520-7431-83cc-6636fdcf61b3'] });
+    const rawEntries = groupConsecutiveToolMessages([cached]);
+    const thread: RemoteThread = {
+      id: '019f99bb-d520-7431-83cc-6636fdcf61b3', title: 'Audit worker', preview: '', updatedAt: 1,
+      state: 'running', unread: 0, cwd: '/tmp', modelProvider: '', parentThreadId: 'parent',
+      agentNickname: 'Singer', agentRole: 'worker', source: null,
+    };
+    const resolved = resolveConversationEntryAgentNames(rawEntries, [thread]);
+    expect(resolved[0]?.agentTargets).toEqual([{ id: thread.id, label: 'Singer', state: 'active' }]);
+    expect(resolveConversationEntryAgentNames(rawEntries, [])[0]?.agentTargets).toEqual([]);
   });
 
   it('labels non-running states explicitly', () => {

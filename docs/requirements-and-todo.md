@@ -198,3 +198,39 @@
 - [x] 增加 5000 条消息派生、固定窗口、冻结阅读窗口、selector 引用和 delta 合并回归测试。
 - [x] 构建并发布 `versionName=0.3.5`、`versionCode=9` APK；Gitea Release `v0.3.5`，SHA-256 见发布记录。
 - [ ] Redmi K80 安装 v0.3.5 后复验：持续流式输出、向上阅读、展开工具组、回到底部均无明显卡顿或跳闪。
+
+
+### v0.3.6 安卓实时一致性、审批提醒与工具时间（2026-07-26）
+
+本轮继续只修改 Android/移动客户端及其文档，不要求服务端变更。
+
+- [x] 修复 Android 刘海/状态栏与底部手势区安全区域，避免标题栏和输入框被系统区域遮挡。
+- [x] 审批、等待输入、任务完成使用三个独立高优先级通知通道和不同提示音；前台、后台 socket 共用稳定通知 ID，并处理迟到通知取消竞争。
+- [x] 运行中允许修改权限/审阅模式，并明确提示设置已发出；已经挂起的旧审批仍须单独处理。
+- [x] 活跃 turn 状态兼容 `inProgress`、`running`、`active`、`started`；思考梗概允许短的新快照替换长的旧快照，不再按文本长度错误保留旧状态。
+- [x] Subagent 工具目标优先读取 `receiverThreads[].thread.agentNickname` 等结构化字段；不再把 UUID 当显示名。
+- [x] 工具组关闭时不挂载 Agent 按钮；展开后只在对应工具调用行内显示 16px 高紧凑 Agent 标签，不单独抽出全部 Subagent。
+- [x] 区分 item 原始时间、实时事件时间、客户端首次观察时间和 turn 排序回退时间：turn 开始时间不再冒充工具/消息时间；首次观察时间用 `≈HH:mm` 标识。
+- [x] 精确/观察时间一旦得到，不允许后续缺少 item 时间的 Desktop snapshot 回退覆盖。
+- [x] Redmi Note 14 Pro+ 真机验证：Agent 标签与 `Subagent · sendInput` 同一行；旧工具不显示伪 `12:53`；在线新增工具显示 `≈15:38`、`≈15:39`。
+- [x] 移动端 TypeScript 类型检查与 12 个测试文件、160 项测试通过。
+- [x] 在独立目录 `/Users/qinyu/codex-computer-use-approval-test` 创建新任务并证明权限映射：`granular` turn 原始策略为 managed workspace-write，但 `sandbox_approval=false`，没有产生审批；`auto` turn 原始策略为 `approval_policy=on-request`，产生真实 `item/commandExecution/requestApproval`，手机收到 `codex_approvals_v4` 通知和审批音。
+- [x] 原生 Computer Use 工具审批已证明：Host 自动探测 ChatGPT/Codex 随包 Node REPL runtime，声明 MCP form elicitation 能力；Redmi 真机显示 `mcpServer/elicitation/request` 审批，手机批准后原生 Computer Use 恢复并完成。
+- [x] 证明 app-server `thread.start` 新任务只进入 app-server/手机客户端任务索引，不会自动出现在 Desktop GUI：现有 Desktop IPC 仅支持跟随/启动已有 Desktop-owned thread，没有创建 GUI 任务的 IPC。
+- [x] 证明 16:11:04 的一字回复已有 rollout `task_complete`，但 Redmi logcat 没有对应 completion fallback；根因是 Desktop GUI 路径可只发 running→idle snapshot/status 而不发 `turn/completed`。
+- [x] Android 后台 socket 增加 active→terminal 状态转换的 900ms completion fallback；显式 `turn/completed` 到达时取消 fallback，并对同任务 2.5 秒内完成事件去重。
+- [x] Xiaomi/Redmi MediaPlayer 兜底提示音按类别做 900ms 去重，避免 WebView 与后台 socket 同时收到同一事件时重复播放。
+- [x] Redmi 真机复验 Desktop GUI 当前任务完成提示音。
+- [x] 构建、校验 `versionName=0.3.6`、`versionCode=10` APK；SHA-256 已写入 v0.3.6 发布记录。
+### v0.3.7 原生 Computer Use 与审批通知去重（2026-07-26）
+
+- [x] 自动探测 `/Applications/ChatGPT.app` 当前 `cua_node` Node REPL、Node、node_modules 和随包 Codex CLI；用进程级配置覆盖修复旧 `/Applications/Codex.app` 路径，不改用户全局配置。
+- [x] app-server 初始化声明 `mcpServerOpenaiFormElicitation: true`。
+- [x] 将 `mcpServer/elicitation/request` 映射为手机审批卡；一次允许/会话允许/拒绝使用 Codex GUI 原生响应结构。
+- [x] Desktop GUI-owned thread 通过 `thread-follower-submit-mcp-server-elicitation-response` 回传审批。
+- [x] 真机端到端：Computer Use 审批可见、审批音可闻、手机批准后 `com.apple.SystemProfiler` 只读调用完成。
+- [x] 修复 `approval.resolved` 被主动响应与 app-server 权威事件重复广播。
+- [x] 修复前台 WebView 与后台 Socket 对同一审批各发一次声音：按稳定 notificationId 原子认领，不用扩大时间窗误伤相邻的不同审批。
+- [x] 构建并安装 v0.3.7（versionCode 11）到 Redmi Note 14 Pro+；新 Computer Use 审批真机日志仅出现 1 次 approval fallback，前台迟到 notifyApproval 被 notificationId 认领拦截。
+- [x] 记录 APK SHA-256：`807591cf75e5a1c30ee6fb807c4ea659fbe3496f2413642506e9a1d590333fb9`。
+- [ ] 完成真机单次铃声复验、Git 审查和发布。

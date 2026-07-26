@@ -196,11 +196,11 @@ export class MobileGateway {
           (typeof params?.requestId === "string" ||
             typeof params?.requestId === "number")
         ) {
-          this.approvals.delete(params.requestId);
-          this.broadcast({
-            type: "approval.resolved",
-            approvalRequestId: params.requestId,
-          });
+          if (this.approvals.delete(params.requestId))
+            this.broadcast({
+              type: "approval.resolved",
+              approvalRequestId: params.requestId,
+            });
         }
         this.updateThreadIndexFromNotification(message.method, params);
         const eventParams = message.method === "thread/status/changed" && typeof params?.threadId === "string"
@@ -1415,7 +1415,9 @@ export class MobileGateway {
       );
       return;
     }
+    const wasPending = this.approvals.has(message.id);
     this.approvals.set(message.id, message);
+    if (wasPending) return;
     const params = message.params ?? {};
     const diff =
       typeof params.threadId === "string" && typeof params.turnId === "string"
@@ -1451,13 +1453,14 @@ export class MobileGateway {
     } else {
       this.bridge.respond(approvalRequestId, result);
     }
-    this.approvals.delete(approvalRequestId);
-    const notification: ServerMessage = {
-      type: "approval.resolved",
-      requestId,
-      approvalRequestId,
-    };
-    this.broadcast(notification);
+    if (this.approvals.delete(approvalRequestId)) {
+      const notification: ServerMessage = {
+        type: "approval.resolved",
+        requestId,
+        approvalRequestId,
+      };
+      this.broadcast(notification);
+    }
   }
 
   private broadcast(message: ServerMessage): void {
@@ -1833,6 +1836,7 @@ function isApprovalMethod(method: string): boolean {
     "item/permissions/requestApproval",
     "execCommandApproval",
     "applyPatchApproval",
+    "mcpServer/elicitation/request",
   ].includes(method);
 }
 
@@ -1877,6 +1881,16 @@ function normalizeApproval(
     message.method.includes("fileChange") ||
     message.method === "applyPatchApproval";
   const isPermissions = message.method === "item/permissions/requestApproval";
+  const isMcpElicitation = message.method === "mcpServer/elicitation/request";
+  const meta = asRecord(params._meta);
+  const connectorName = typeof meta?.connector_name === "string"
+    ? meta.connector_name
+    : typeof params.serverName === "string"
+      ? params.serverName
+      : "MCP 工具";
+  const persistentChoices = Array.isArray(meta?.persist)
+    ? meta.persist.map(String)
+    : [];
   const rawDecisions = Array.isArray(params.availableDecisions)
     ? params.availableDecisions.flatMap((value) => {
         const normalized = normalizeApprovalDecision(value);
@@ -1900,12 +1914,15 @@ function normalizeApproval(
         : typeof params.callId === "string"
           ? params.callId
           : undefined,
-    title: isPermissions
+    title: isMcpElicitation
+      ? `允许 ${connectorName} 操作？`
+      : isPermissions
       ? "允许额外权限？"
       : isFileChange
         ? "允许修改文件？"
         : "允许执行命令？",
     detail:
+      (isMcpElicitation && typeof params.message === "string" ? params.message : undefined) ??
       diff ??
       command ??
       reason ??
@@ -1915,7 +1932,9 @@ function normalizeApproval(
     command,
     cwd,
     reason,
-    availableDecisions: rawDecisions?.length
+    availableDecisions: isMcpElicitation
+      ? ["decline", "accept", ...(persistentChoices.includes("session") ? ["acceptForSession" as const] : [])]
+      : rawDecisions?.length
       ? rawDecisions
       : ["accept", "acceptForSession", "decline"],
     raw: params,
@@ -1976,6 +1995,21 @@ function approvalResult(
   decision: ApprovalDecision,
   params?: Record<string, unknown>,
 ): unknown {
+  if (method === "mcpServer/elicitation/request") {
+    if (decision === "accept" || decision === "acceptForSession") {
+      const persistForSession = decision === "acceptForSession";
+      return {
+        action: "accept",
+        content: {},
+        _meta: persistForSession ? { persist: "session" } : null,
+      };
+    }
+    return {
+      action: decision === "decline" ? "decline" : "cancel",
+      content: null,
+      _meta: null,
+    };
+  }
   if (method === "item/permissions/requestApproval") {
     const requested = asRecord(params?.permissions) ?? {};
     const accepted = decision === "accept" || decision === "acceptForSession";

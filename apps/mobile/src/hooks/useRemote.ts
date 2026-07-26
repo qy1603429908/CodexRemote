@@ -59,13 +59,17 @@ export function visibleUserText(value: string): string {
     .trim();
 }
 
-function timestamp(value: unknown, fallback = Date.now()): number {
+function parsedTimestamp(value: unknown): number | null {
   if (typeof value === 'number' && Number.isFinite(value)) return value < 10_000_000_000 ? value * 1000 : value;
   if (typeof value === 'string') {
     const parsed = Date.parse(value);
     if (Number.isFinite(parsed)) return parsed;
   }
-  return fallback;
+  return null;
+}
+
+function timestamp(value: unknown, fallback = Date.now()): number {
+  return parsedTimestamp(value) ?? fallback;
 }
 
 export function consumeThreadActivationIntent(
@@ -98,6 +102,11 @@ export function stateFromStatus(value: unknown): ThreadState {
   if (text.includes('notloaded') || text.includes('not_loaded') || text.includes('unloaded')) return 'not_loaded';
   if (text.includes('idle') || text.includes('complete')) return 'idle';
   return 'unknown';
+}
+
+export function isActiveTurnStatus(value: unknown): boolean {
+  const status = String(value ?? '').trim().toLowerCase().replace(/[^a-z]/g, '');
+  return status === 'inprogress' || status === 'running' || status === 'active' || status === 'started';
 }
 
 function subagentMetadataFromSource(sourceValue: unknown): { parentThreadId?: string; agentNickname?: string; agentRole?: string } {
@@ -390,6 +399,7 @@ export function itemToMessage(itemValue: unknown, threadId: string, turnId: stri
     ? `发送了 ${attachments.length} 张图片`
     : `发送了 ${attachments.length} 个附件`;
   const statusText = String(item.status ?? '').toLowerCase();
+  const itemCreatedAt = parsedTimestamp(item.createdAt ?? item.created_at ?? restoreMessage?.createdAt);
   return {
     id,
     threadId,
@@ -397,7 +407,8 @@ export function itemToMessage(itemValue: unknown, threadId: string, turnId: stri
     role,
     content,
     ...(attachments.length ? { attachments } : {}),
-    createdAt: timestamp(item.createdAt ?? item.created_at ?? restoreMessage?.createdAt, fallbackCreatedAt),
+    createdAt: itemCreatedAt ?? fallbackCreatedAt,
+    timestampSource: itemCreatedAt != null ? 'item' : 'turn',
     durationMs: typeof item.durationMs === 'number' ? item.durationMs : undefined,
     status: statusText.includes('progress') || (turnInProgress && normalizedType.includes('reasoning')) ? 'streaming' : statusText.includes('fail') ? 'failed' : 'complete',
     toolName,
@@ -455,11 +466,17 @@ function withoutProjectedMessageAliases(
 
 function preserveFresherLiveMessage(current: RemoteMessage | undefined, incoming: RemoteMessage): RemoteMessage {
   if (!current) return incoming;
-  const currentHasLongerContent = current.content.length > incoming.content.length;
+  const preserveObservedTimestamp = current.timestampSource != null && current.timestampSource !== 'turn' && incoming.timestampSource === 'turn';
+  const incomingType = incoming.itemType?.toLowerCase() ?? '';
+  // Reasoning summaries are replaceable activity labels, not append-only answer text.
+  // A newer Desktop snapshot may legitimately replace a long old summary with a short
+  // current one, so content length must never decide which reasoning text wins.
+  const currentHasLongerContent = !incomingType.includes('reasoning') && current.content.length > incoming.content.length;
   const preventsTerminalDowngrade = current.status !== 'streaming' && incoming.status === 'streaming';
-  if (!currentHasLongerContent && !preventsTerminalDowngrade) return incoming;
+  if (!currentHasLongerContent && !preventsTerminalDowngrade && !preserveObservedTimestamp) return incoming;
   return {
     ...incoming,
+    ...(preserveObservedTimestamp ? { createdAt: current.createdAt, timestampSource: current.timestampSource } : {}),
     ...((currentHasLongerContent || preventsTerminalDowngrade)
       ? { content: current.content, detail: current.detail ?? incoming.detail }
       : {}),
@@ -638,6 +655,7 @@ export function applyPendingMessageDeltas(
           role: delta.role,
           content: delta.delta,
           createdAt: delta.createdAt,
+          timestampSource: 'live',
           status: 'streaming',
           toolName: delta.toolName,
           itemType: delta.itemType,
@@ -721,13 +739,22 @@ export function reconcileThreadSnapshot(
   current: RemoteMessage[],
   incoming: RemoteMessage[],
   targetThreadId = incoming[0]?.threadId ?? current[0]?.threadId,
+  observedTurnId?: string,
+  observedAt = Date.now(),
 ): RemoteMessage[] {
   const ownedCurrent = targetThreadId ? messagesForThread(targetThreadId, current) : [];
   const ownedIncoming = targetThreadId ? messagesForThread(targetThreadId, incoming) : [];
   if (ownedIncoming.length === 0) return ownedCurrent;
   const currentById = new Map(ownedCurrent.map((message) => [message.id, message]));
+  const canObserveNewItems = ownedCurrent.length > 0 && Boolean(observedTurnId);
   const authoritative = dedupeMessages(ownedIncoming)
-    .map((message) => preserveFresherLiveMessage(currentById.get(message.id), message));
+    .map((message) => {
+      const currentMessage = currentById.get(message.id);
+      const observedMessage = !currentMessage && canObserveNewItems && message.turnId === observedTurnId && message.timestampSource === 'turn'
+        ? { ...message, createdAt: observedAt, timestampSource: 'observed' as const }
+        : message;
+      return preserveFresherLiveMessage(currentMessage, observedMessage);
+    });
   const coveredTurnIds = [...new Set(authoritative.flatMap((message) => message.turnId ? [message.turnId] : []))];
   if (coveredTurnIds.length === 0) return reconcileMessages(ownedCurrent, authoritative, 'append', targetThreadId);
 
@@ -768,10 +795,13 @@ export function reconcileThreadSnapshot(
     });
     const eventTail = (liveTailByTurn.get(turnId) ?? []).filter((message) => {
       const type = message.itemType?.toLowerCase() ?? '';
-      // Desktop snapshots are authoritative for transient reasoning/plan state. Event
-      // aliases often use synthetic IDs, so retaining an older unmatched delta after the
-      // canonical block makes the transient footer jump back to stale text.
-      if (canonicalHasReasoning && type.includes('reasoning')) return false;
+      // Drop only projection/fallback reasoning aliases once a canonical snapshot has
+      // them. A real opaque live item that is not in the snapshot yet must remain as the
+      // event tail; otherwise a delayed Desktop snapshot can erase a newer live summary.
+      if (canonicalHasReasoning && type.includes('reasoning')) {
+        const syntheticDeltaId = Boolean(message.turnId && message.id.startsWith(`${message.turnId}_item/reasoning/`));
+        if (isSyntheticProjectedMessage(message) || syntheticDeltaId) return false;
+      }
       if (canonicalHasPlan && (type.includes('plan') || type.includes('todo'))) return false;
       return true;
     });
@@ -830,14 +860,14 @@ export function normalizeThreadPayload(payload: unknown): {
     if (turnOwner && turnOwner !== id) return;
     const turnId = stringValue(turn.id, turn.turnId) ?? `turn_${turnIndex}`;
     const turnStatus = String(turn.status ?? '').toLowerCase();
-    if (turnStatus.includes('progress')) currentTurnId = turnId;
+    if (isActiveTurnStatus(turnStatus)) currentTurnId = turnId;
     const ownedItems = (Array.isArray(turn.items) ? turn.items : []).filter((item) => {
       const itemOwner = explicitThreadOwner(item);
       return !itemOwner || itemOwner === id;
     });
     const items = canonicalProjectedItems(ownedItems);
     items.forEach((item, itemIndex) => {
-      const message = itemToMessage(item, id, turnId, itemIndex, timestamp(turn.startedAt ?? turn.turnStartedAtMs ?? turn.startedAtMs, 0), turnStatus.includes('progress'));
+      const message = itemToMessage(item, id, turnId, itemIndex, timestamp(turn.startedAt ?? turn.turnStartedAtMs ?? turn.startedAtMs, 0), isActiveTurnStatus(turnStatus));
       if (message) messages.push(message);
     });
   });
@@ -883,6 +913,7 @@ function normalizeApproval(approval: WireApprovalRequest): ApprovalRequest {
     threadId: approval.threadId,
     turnId: approval.turnId,
     title: approval.title,
+    method: approval.method,
     description: approval.detail ?? approval.reason,
     command: approval.command,
     cwd: approval.cwd,
@@ -979,7 +1010,7 @@ export function compactionStatusFromThreadPayload(payload: unknown, now = Date.n
     const startedAt = timestamp(turn.startedAt ?? turn.turnStartedAtMs ?? turn.startedAtMs, now);
     const completedAt = timestamp(turn.completedAt ?? turn.completedAtMs, now);
     const turnId = stringValue(turn.id, turn.turnId);
-    if (status.includes('progress')) {
+    if (isActiveTurnStatus(status)) {
       return { threadId, phase: 'running', startedAt, updatedAt: now, turnId, automatic: true };
     }
     if ((status.includes('fail') || status.includes('interrupt')) && now - completedAt <= 5 * 60_000) {
@@ -1021,6 +1052,11 @@ export function useRemote(config: RemoteConfig | null) {
   const [selectedModel, setSelectedModelState] = useState('');
   const [selectedEffort, setSelectedEffortState] = useState('');
   const [selectedPermissionMode, setSelectedPermissionModeState] = useState<PermissionMode>('auto');
+  const selectedPermissionModeRef = useRef<PermissionMode>('auto');
+  const [permissionModeStatus, setPermissionModeStatus] = useState('');
+  const permissionModeStatusTimerRef = useRef<number | null>(null);
+  const pendingPermissionSettingsRef = useRef<Map<string, { threadId: string; mode: PermissionMode; previous: PermissionMode }>>(new Map());
+  const permissionModeOverridesRef = useRef<Record<string, { requestId: string; mode: PermissionMode; expiresAt: number }>>({});
   const [threads, setThreads] = useState<RemoteThread[]>([]);
   const [selectedThreadId, setSelectedThreadId] = useState<string | null>(null);
   const [messagesByThread, setMessagesByThread] = useState<Record<string, RemoteMessage[]>>({});
@@ -1040,6 +1076,31 @@ export function useRemote(config: RemoteConfig | null) {
   const [historyByThread, setHistoryByThread] = useState<Record<string, CachedHistoryState>>({});
   const [historyLoadingByThread, setHistoryLoadingByThread] = useState<Record<string, boolean>>({});
   const historyByThreadRef = useRef<Record<string, CachedHistoryState>>({});
+
+  const setSelectedPermissionMode = useCallback((mode: PermissionMode) => {
+    selectedPermissionModeRef.current = mode;
+    setSelectedPermissionModeState(mode);
+  }, []);
+
+  const showPermissionModeStatus = useCallback((text: string, autoDismiss = true) => {
+    if (permissionModeStatusTimerRef.current != null) window.clearTimeout(permissionModeStatusTimerRef.current);
+    permissionModeStatusTimerRef.current = null;
+    setPermissionModeStatus(text);
+    if (text && autoDismiss) {
+      permissionModeStatusTimerRef.current = window.setTimeout(() => {
+        permissionModeStatusTimerRef.current = null;
+        setPermissionModeStatus('');
+      }, 6_000);
+    }
+  }, []);
+
+  const applyPermissionModeSnapshot = useCallback((threadId: string, mode: PermissionMode) => {
+    if (selectedThreadRef.current !== threadId) return;
+    const override = permissionModeOverridesRef.current[threadId];
+    if (!shouldApplyPermissionModeSnapshot(mode, override, Date.now())) return;
+    if (override?.mode === mode) override.expiresAt = Date.now() + 3_000;
+    setSelectedPermissionMode(mode);
+  }, [setSelectedPermissionMode]);
   const messagesByThreadRef = useRef<Record<string, RemoteMessage[]>>({});
   const pendingMessageDeltasRef = useRef<Map<string, PendingMessageDelta>>(new Map());
   const pendingMessageDeltaTimerRef = useRef<number | null>(null);
@@ -1159,7 +1220,7 @@ export function useRemote(config: RemoteConfig | null) {
     const outer = record(payload);
     const thread = record(outer?.thread) ?? outer;
     const turns = Array.isArray(thread?.turns) ? thread.turns : [];
-    const activeTurn = [...turns].reverse().map(record).find((turn) => turn && String(turn.status ?? '').toLowerCase().includes('progress'));
+    const activeTurn = [...turns].reverse().map(record).find((turn) => turn && isActiveTurnStatus(turn.status));
     const latestTurn = record(turns.at(-1));
     if (!activeTurn && latestTurn && String(latestTurn.status ?? '').toLowerCase().includes('fail')) {
       const error = record(latestTurn.error);
@@ -1194,16 +1255,24 @@ export function useRemote(config: RemoteConfig | null) {
   }, []);
 
   const clearThreadAttentionNotification = useCallback((threadId: string) => {
-    notificationGuardRef.current.invalidate(`attention:${threadId}`);
+    const previousState = attentionStateByThreadRef.current[threadId];
+    const notifiedState = notifiedAttentionStateByThreadRef.current[threadId];
     const pendingTimer = attentionNotificationTimersRef.current[threadId];
+    if (previousState === undefined && notifiedState === undefined && pendingTimer === undefined) return;
+
+    notificationGuardRef.current.invalidate(`attention:${threadId}`);
     if (pendingTimer !== undefined) window.clearTimeout(pendingTimer);
     delete attentionNotificationTimersRef.current[threadId];
     delete attentionStateByThreadRef.current[threadId];
     delete notifiedAttentionStateByThreadRef.current[threadId];
-    // Both IDs are deterministic. Cancelling both also cleans a notification delivered
-    // after an earlier async schedule crossed this state transition.
-    void queueAttentionCancellation(threadId, 'approval');
-    void queueAttentionCancellation(threadId, 'input');
+
+    // A pending timer that never fired did not post anything. Once scheduling has started,
+    // its timer entry is removed first, so cancel the one relevant deterministic ID to
+    // close that race without issuing two native calls for every ordinary thread snapshot.
+    const stateToCancel = notifiedState ?? (pendingTimer === undefined ? previousState : undefined);
+    if (stateToCancel === 'waiting_approval' || stateToCancel === 'waiting_input') {
+      void queueAttentionCancellation(threadId, stateToCancel === 'waiting_input' ? 'input' : 'approval');
+    }
   }, [queueAttentionCancellation]);
 
   const updateAttentionNotification = useCallback((threadId: string, state: ThreadState) => {
@@ -1277,7 +1346,13 @@ export function useRemote(config: RemoteConfig | null) {
     }
     threadsRef.current = nextThreads;
     setThreads(nextThreads);
-    for (const thread of nextThreads) updateAttentionNotification(thread.id, thread.state);
+    for (const thread of nextThreads) {
+      const waiting = thread.state === 'waiting_approval' || thread.state === 'waiting_input';
+      const tracked = attentionStateByThreadRef.current[thread.id] !== undefined
+        || notifiedAttentionStateByThreadRef.current[thread.id] !== undefined
+        || attentionNotificationTimersRef.current[thread.id] !== undefined;
+      if (waiting || tracked) updateAttentionNotification(thread.id, thread.state);
+    }
   }, [clearThreadAttentionNotification, updateAttentionNotification]);
 
   const flushPendingMessageDeltas = useCallback(() => {
@@ -1338,10 +1413,11 @@ export function useRemote(config: RemoteConfig | null) {
           if (latestTodo) setTodoByThread((current) => ({ ...current, [normalized.thread!.id]: latestTodo }));
           replaceThreadsAndSyncAttention(sortThreads(upsertById(threadsRef.current, normalized.thread!)));
           if (selectedThreadRef.current === normalized.thread.id) {
-            setMessagesByThread((current) => ({ ...current, [normalized.thread!.id]: reconcileThreadSnapshot(current[normalized.thread!.id] ?? [], normalized.messages, normalized.thread!.id) }));
+            const observedTurnId = normalized.currentTurnId ?? normalized.messages.at(-1)?.turnId;
+            setMessagesByThread((current) => ({ ...current, [normalized.thread!.id]: reconcileThreadSnapshot(current[normalized.thread!.id] ?? [], normalized.messages, normalized.thread!.id, observedTurnId) }));
             if (normalized.thread.model) setSelectedModelState(normalized.thread.model);
             if (normalized.thread.effort) setSelectedEffortState(normalized.thread.effort);
-            if (normalized.thread.permissionMode) setSelectedPermissionModeState(normalized.thread.permissionMode);
+            if (normalized.thread.permissionMode) applyPermissionModeSnapshot(normalized.thread.id, normalized.thread.permissionMode);
             setTurnIds((current) => turnIdsAfterSnapshot(current, normalized.thread!.id, normalized.currentTurnId));
           }
         }
@@ -1443,6 +1519,7 @@ export function useRemote(config: RemoteConfig | null) {
               role: 'system',
               content: errorText,
               createdAt: Date.now(),
+              timestampSource: 'live',
               status: 'failed',
               toolName: '错误',
             });
@@ -1523,6 +1600,7 @@ export function useRemote(config: RemoteConfig | null) {
             role: 'system',
             content: [typeof params?.explanation === 'string' ? params.explanation : '', text].filter(Boolean).join('\n'),
             createdAt: Date.now(),
+            timestampSource: 'live',
             status: 'streaming',
             toolName: '计划',
             itemType: 'plan',
@@ -1601,9 +1679,12 @@ export function useRemote(config: RemoteConfig | null) {
           if (method === 'item/started') {
             normalized.status = 'streaming';
             normalized.createdAt = itemStartedAtRef.current[timingKey] ?? normalized.createdAt;
+            normalized.timestampSource = 'live';
           } else {
             const completedAt = typeof params?.completedAtMs === 'number' ? params.completedAtMs : Date.now();
             const startedAt = itemStartedAtRef.current[timingKey];
+            normalized.createdAt = startedAt ?? completedAt;
+            normalized.timestampSource = 'live';
             normalized.completedAt = completedAt;
             if (normalized.durationMs == null && startedAt != null) normalized.durationMs = Math.max(0, completedAt - startedAt);
             delete itemStartedAtRef.current[timingKey];
@@ -1777,9 +1858,19 @@ export function useRemote(config: RemoteConfig | null) {
           if (message.requestId) pendingCompactionRequestsRef.current.delete(message.requestId);
           updateCompactionStatus(message.threadId, { phase: 'requested', message: '上下文压缩请求已受理' });
           break;
-        case 'thread.settings.updated':
-          setLastError('模型设置已更新');
+        case 'thread.settings.updated': {
+          const pending = message.requestId ? pendingPermissionSettingsRef.current.get(message.requestId) : undefined;
+          if (message.requestId) pendingPermissionSettingsRef.current.delete(message.requestId);
+          if (pending) {
+            const override = permissionModeOverridesRef.current[pending.threadId];
+            if (override?.requestId === message.requestId) override.expiresAt = Date.now() + 15_000;
+            if (selectedThreadRef.current === pending.threadId) {
+              const hasPendingApproval = approvalsRef.current.some((approval) => approval.threadId === pending.threadId);
+              showPermissionModeStatus(`已应用“${permissionModeLabel(pending.mode)}”到当前任务${hasPendingApproval ? '；切换前已挂起的审批仍需单独处理' : ''}`);
+            }
+          }
           break;
+        }
         case 'thread': {
           const normalized = normalizeThreadPayload(message.thread);
           if (!normalized.thread) break;
@@ -1787,9 +1878,13 @@ export function useRemote(config: RemoteConfig | null) {
           const latestTodo = latestPlanMessage(normalized.messages);
           if (latestTodo) setTodoByThread((current) => ({ ...current, [normalized.thread!.id]: latestTodo }));
           replaceThreadsAndSyncAttention(sortThreads(upsertById(threadsRef.current, normalized.thread!)));
+          const isSelectedLiveSnapshot = selectedThreadRef.current === normalized.thread.id && !message.history;
+          const observedTurnId = normalized.currentTurnId ?? normalized.messages.at(-1)?.turnId;
           setMessagesByThread((current) => ({
             ...current,
-            [normalized.thread!.id]: reconcileMessages(current[normalized.thread!.id] ?? [], normalized.messages, 'append', normalized.thread!.id),
+            [normalized.thread!.id]: isSelectedLiveSnapshot
+              ? reconcileThreadSnapshot(current[normalized.thread!.id] ?? [], normalized.messages, normalized.thread!.id, observedTurnId)
+              : reconcileMessages(current[normalized.thread!.id] ?? [], normalized.messages, 'append', normalized.thread!.id),
           }));
           if (message.history) setHistoryByThread((current) => ({
             ...current,
@@ -1808,7 +1903,7 @@ export function useRemote(config: RemoteConfig | null) {
           if (selectedThreadRef.current === normalized.thread.id) {
             if (normalized.thread.model) setSelectedModelState(normalized.thread.model);
             if (normalized.thread.effort) setSelectedEffortState(normalized.thread.effort);
-            if (normalized.thread.permissionMode) setSelectedPermissionModeState(normalized.thread.permissionMode);
+            if (normalized.thread.permissionMode) applyPermissionModeSnapshot(normalized.thread.id, normalized.thread.permissionMode);
           }
           break;
         }
@@ -1894,6 +1989,16 @@ export function useRemote(config: RemoteConfig | null) {
           break;
         }
         case 'error': {
+          const permissionSetting = message.requestId ? pendingPermissionSettingsRef.current.get(message.requestId) : undefined;
+          if (message.requestId) pendingPermissionSettingsRef.current.delete(message.requestId);
+          if (permissionSetting) {
+            const override = permissionModeOverridesRef.current[permissionSetting.threadId];
+            if (override?.requestId === message.requestId) {
+              delete permissionModeOverridesRef.current[permissionSetting.threadId];
+              if (selectedThreadRef.current === permissionSetting.threadId) setSelectedPermissionMode(permissionSetting.previous);
+            }
+            showPermissionModeStatus(`权限设置失败：[${message.code}] ${message.message}`);
+          }
           const compactionThreadId = message.requestId ? pendingCompactionRequestsRef.current.get(message.requestId) : undefined;
           if (message.requestId) {
             pendingCompactionRequestsRef.current.delete(message.requestId);
@@ -1908,7 +2013,7 @@ export function useRemote(config: RemoteConfig | null) {
       }
       if (typeof message.syncCursor === 'number') syncCursorRef.current = Math.max(syncCursorRef.current, message.syncCursor);
     },
-    [clearThreadAttentionNotification, handleEvent, observeCompactionSnapshot, replaceThreadsAndSyncAttention, reportCompactionFailure, updateAttentionNotification, updateCompactionStatus, updateThreadState],
+    [applyPermissionModeSnapshot, clearThreadAttentionNotification, handleEvent, observeCompactionSnapshot, replaceThreadsAndSyncAttention, reportCompactionFailure, setSelectedPermissionMode, showPermissionModeStatus, updateAttentionNotification, updateCompactionStatus, updateThreadState],
   );
   handleMessageRef.current = handleMessage;
 
@@ -1929,7 +2034,7 @@ export function useRemote(config: RemoteConfig | null) {
     setSkills([]);
     setSelectedModelState('');
     setSelectedEffortState('');
-    setSelectedPermissionModeState('auto');
+    setSelectedPermissionMode('auto');
     setTodoByThread({});
     setPromptQueueByThread({});
     setGitDiffByThread({});
@@ -1950,6 +2055,9 @@ export function useRemote(config: RemoteConfig | null) {
     compactionTurnIdsRef.current = {};
     pendingCompactionRequestsRef.current.clear();
     pendingThreadStartRequestsRef.current.clear();
+    pendingPermissionSettingsRef.current.clear();
+    permissionModeOverridesRef.current = {};
+    showPermissionModeStatus('');
     notifiedCompactionFailuresRef.current.clear();
     seenCompactionItemsRef.current = {};
 
@@ -2014,7 +2122,7 @@ export function useRemote(config: RemoteConfig | null) {
       if (socketRef.current === socket) socketRef.current = null;
       void appListener?.remove();
     };
-  }, [config, updateAttentionNotification]);
+  }, [config, setSelectedPermissionMode, showPermissionModeStatus, updateAttentionNotification]);
 
   useEffect(() => {
     if (!config || !cacheHydratedRef.current || !cacheScopeRef.current) return;
@@ -2064,8 +2172,12 @@ export function useRemote(config: RemoteConfig | null) {
     if (!sent) setHistoryLoadingByThread((current) => ({ ...current, [threadId]: false }));
     socketRef.current?.send({ type: 'thread.diff.get', requestId: createRequestId('diff'), threadId });
     const thread = threads.find((candidate) => candidate.id === threadId);
+    const override = permissionModeOverridesRef.current[threadId];
+    if (override && override.expiresAt > Date.now()) setSelectedPermissionMode(override.mode);
+    else setSelectedPermissionMode(thread?.permissionMode ?? 'auto');
+    showPermissionModeStatus('');
     if (thread?.cwd) socketRef.current?.send({ type: 'skills.list', requestId: createRequestId('skills'), cwd: thread.cwd });
-  }, [threads]);
+  }, [setSelectedPermissionMode, showPermissionModeStatus, threads]);
 
   const loadOlderHistory = useCallback(() => {
     const threadId = selectedThreadRef.current;
@@ -2093,6 +2205,7 @@ export function useRemote(config: RemoteConfig | null) {
         role: 'system',
         content: body,
         createdAt: Date.now(),
+        timestampSource: 'live',
         status: 'complete',
         toolName: title,
         collapsible: true,
@@ -2273,6 +2386,7 @@ export function useRemote(config: RemoteConfig | null) {
         role: 'user',
         content: prompt || `请查看我上传的 ${attachments.length} 个文件。`,
         createdAt: Date.now(),
+        timestampSource: 'live',
         status: 'complete',
         ...(attachments.length ? { attachments: optimisticAttachmentsFromUploads(attachments) } : {}),
         detail: { clientUserMessageId },
@@ -2388,15 +2502,31 @@ export function useRemote(config: RemoteConfig | null) {
   }, [selectedModel]);
 
   const selectPermissionMode = useCallback((permissionMode: PermissionMode) => {
-    setSelectedPermissionModeState(permissionMode);
     const threadId = selectedThreadRef.current;
-    if (threadId) socketRef.current?.send({
+    if (!threadId) return;
+    const previous = selectedPermissionModeRef.current;
+    const requestId = createRequestId('permission-settings');
+    setSelectedPermissionMode(permissionMode);
+    pendingPermissionSettingsRef.current.set(requestId, { threadId, mode: permissionMode, previous });
+    permissionModeOverridesRef.current[threadId] = {
+      requestId,
+      mode: permissionMode,
+      expiresAt: Date.now() + 15_000,
+    };
+    showPermissionModeStatus(`正在应用“${permissionModeLabel(permissionMode)}”…`, false);
+    const sent = socketRef.current?.send({
       type: 'thread.settings',
-      requestId: createRequestId('settings'),
+      requestId,
       threadId,
       permissionMode,
     });
-  }, []);
+    if (!sent) {
+      pendingPermissionSettingsRef.current.delete(requestId);
+      delete permissionModeOverridesRef.current[threadId];
+      setSelectedPermissionMode(previous);
+      showPermissionModeStatus('权限设置失败：当前未连接');
+    }
+  }, [setSelectedPermissionMode, showPermissionModeStatus]);
 
   const loadHostAttachment = useCallback(async (path: string) => {
     if (!config) throw new Error('尚未配置 Host 连接。');
@@ -2450,6 +2580,9 @@ export function useRemote(config: RemoteConfig | null) {
     compactionTurnIdsRef.current = {};
     pendingCompactionRequestsRef.current.clear();
     pendingThreadStartRequestsRef.current.clear();
+    pendingPermissionSettingsRef.current.clear();
+    permissionModeOverridesRef.current = {};
+    showPermissionModeStatus('');
     notifiedCompactionFailuresRef.current.clear();
     seenCompactionItemsRef.current = {};
     serverIdRef.current = undefined;
@@ -2459,7 +2592,7 @@ export function useRemote(config: RemoteConfig | null) {
     cacheHydratedRef.current = true;
     setPhaseDetail('本地缓存已清空，正在从 Host 全量重新载入');
     socketRef.current?.reconnectNow();
-  }, []);
+  }, [showPermissionModeStatus]);
 
   const reconnect = useCallback(() => socketRef.current?.reconnectNow(), []);
   const dismissError = useCallback(() => setLastError(''), []);
@@ -2503,6 +2636,7 @@ export function useRemote(config: RemoteConfig | null) {
     selectedModel,
     selectedEffort,
     selectedPermissionMode,
+    permissionModeStatus,
     threads,
     selectedThread,
     selectedThreadId,
@@ -2544,6 +2678,24 @@ export function dedupeQueueItems(items: PromptQueueItem[]): PromptQueueItem[] {
   const byClientId = new Map<string, PromptQueueItem>();
   for (const item of items) byClientId.set(`${item.threadId}:${item.clientUserMessageId}`, item);
   return [...byClientId.values()].sort((a, b) => a.createdAt - b.createdAt);
+}
+
+export function shouldApplyPermissionModeSnapshot(
+  snapshotMode: PermissionMode,
+  override: { mode: PermissionMode; expiresAt: number } | undefined,
+  now: number,
+): boolean {
+  return !override || override.expiresAt <= now || override.mode === snapshotMode;
+}
+
+export function permissionModeLabel(mode: PermissionMode): string {
+  switch (mode) {
+    case 'granular': return '严格确认';
+    case 'read-only': return '严格审阅 · 只读';
+    case 'guardian-approvals': return '替我审阅';
+    case 'full-access': return '完全访问';
+    default: return '自动 · 工作区';
+  }
 }
 
 export function threadStateLabel(state: ThreadState): string {

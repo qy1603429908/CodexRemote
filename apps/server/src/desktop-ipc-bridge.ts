@@ -375,6 +375,18 @@ export class DesktopIpcBridge extends EventEmitter {
       );
       return;
     }
+    if (method === "mcpServer/elicitation/request") {
+      await this.requestFollower(
+        conversationId,
+        "thread-follower-submit-mcp-server-elicitation-response",
+        {
+          conversationId,
+          requestId,
+          response: payload,
+        },
+      );
+      return;
+    }
     throw new Error(`Unsupported Desktop IPC approval method: ${method}`);
   }
 
