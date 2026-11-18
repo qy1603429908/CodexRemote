@@ -9,6 +9,7 @@ import WebSocket from "ws";
 import { MobileGateway, desktopAttachmentPaths, isAbsoluteHostPath, projectDesktopLiveThread } from "../src/gateway.js";
 import type { ServerConfig } from "../src/config.js";
 import { PromptQueueStore } from "../src/prompt-queue.js";
+import { SubmissionLedger } from "../src/submission-ledger.js";
 
 
 describe("Desktop live turn projection", () => {
@@ -48,6 +49,7 @@ class FakeBridge extends EventEmitter {
   ready = true;
   calls: Array<{ method: string; params: unknown }> = [];
   responses: Array<{ id: string | number; result: unknown }> = [];
+  errors: unknown[] = [];
   threadListData: Array<Record<string, unknown>> = [
     { id: "thread-1", name: "Test", preview: "Hello", cwd: "/tmp", modelProvider: "custom", updatedAt: 1, status: { type: "notLoaded" }, parentThreadId: null, agentNickname: null, agentRole: null, source: "appServer" },
     { id: "agent-1", name: "Agent", preview: "Review", cwd: "/tmp", modelProvider: "custom", updatedAt: 2, status: { type: "notLoaded" }, source: { subAgent: { thread_spawn: { parent_thread_id: "thread-1", agent_nickname: "Meitner", agent_role: "reviewer" } } } },
@@ -75,7 +77,7 @@ class FakeBridge extends EventEmitter {
     return {};
   }
   respond(id: string | number, result: unknown): void { this.responses.push({ id, result }); }
-  respondError(): void {}
+  respondError(...args: unknown[]): void { this.errors.push(args); }
 }
 
 class FakeDesktop extends EventEmitter {
@@ -83,9 +85,12 @@ class FakeDesktop extends EventEmitter {
   ready = true;
   supported = true;
   steerError: Error | null = null;
+  replyError: Error | null = null;
+  identity = "owner-generation-1";
   conversation: Record<string, unknown> = { id: "thread-1", threadRuntimeStatus: { type: "active", activeFlags: [] }, turns: [{ id: "turn-active", status: "inProgress", items: [] }] };
   calls: Array<{ method: string; threadId: string; params: Record<string, unknown> }> = [];
   hasOwner(): boolean { return this.owner; }
+  controlIdentity(): string | null { return this.ready && this.owner ? this.identity : null; }
   getConversation(): Record<string, unknown> { return this.conversation; }
   async openConversation(): Promise<Record<string, unknown> | null> {
     return this.owner ? this.conversation : null;
@@ -98,6 +103,10 @@ class FakeDesktop extends EventEmitter {
   async startTurn(threadId: string, params: Record<string, unknown>): Promise<unknown> {
     this.calls.push({ method: "start", threadId, params });
     return { id: "started" };
+  }
+  async replyUserInput(threadId: string, requestId: string | number, response: unknown): Promise<void> {
+    this.calls.push({ method: "reply", threadId, params: { requestId, response } });
+    if (this.replyError) throw this.replyError;
   }
   async interruptTurn(threadId: string, mode: "user" | "system"): Promise<unknown> {
     this.calls.push({ method: "interrupt", threadId, params: { mode } });
@@ -124,9 +133,9 @@ const config: ServerConfig = {
 const closers: Array<() => Promise<void>> = [];
 afterEach(async () => { while (closers.length) await closers.pop()?.(); });
 
-async function start(desktop?: FakeDesktop, promptQueue?: PromptQueueStore) {
+async function start(desktop?: FakeDesktop, promptQueue?: PromptQueueStore, ledger?: SubmissionLedger) {
   const bridge = new FakeBridge();
-  const gateway = new MobileGateway(bridge as never, config, desktop as never, undefined, promptQueue);
+  const gateway = new MobileGateway(bridge as never, config, desktop as never, undefined, promptQueue, ledger);
   const server = createServer();
   server.on("upgrade", (request, socket, head) => gateway.handleUpgrade(request, socket, head));
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -187,6 +196,378 @@ describe("Desktop attachment extraction", () => {
 });
 
 describe("MobileGateway", () => {
+  async function inputClient(desktop?: FakeDesktop, ledger?: SubmissionLedger) {
+    const started = await start(desktop, undefined, ledger);
+    const ws = new WebSocket(`ws://127.0.0.1:${started.port}/ws`, ["codex-mobile-v1", `token.${Buffer.from(token).toString("base64url")}`], { origin: "capacitor://localhost" });
+    const messages: Array<Record<string, unknown>> = [];
+    ws.on("message", data => messages.push(JSON.parse(data.toString())));
+    await new Promise<void>((resolve, reject) => { ws.once("open", resolve); ws.once("error", reject); });
+    closers.push(async () => { ws.close(); });
+    return { ...started, ws, messages };
+  }
+  const nativeRequest = { id: 42, method: "item/tool/requestUserInput", params: { threadId: "thread-1", turnId: "turn-active", itemId: "item-input", questions: [{ id: "q", header: "Pick", question: "Choose?", isOther: true, options: [{ label: "A", description: "First" }] }] } };
+  const asyncConversation = () => ({ id: "thread-1", cwd: "D:\\project", threadRuntimeStatus: { type: "active" }, turns: [{ id: "turn-active", status: "inProgress", items: [{ id: "agent-question", type: "agentMessage", questions: [{ title: "Choose?", options: ["A", "B"] }] }] }] });
+  const asyncId = '["async","turn-active","agent-question",["[\\"request_user_input_async\\",\\"agent-question\\",0]"]]';
+  const asyncQuestionId = '["request_user_input_async","agent-question",0]';
+  const answerMessage = (inputId = asyncId, answers = { [asyncQuestionId]: ["A"] }, clientUserMessageId = "answer-1") => ({ type: "user-input.answer", requestId: clientUserMessageId, threadId: "thread-1", inputId, answers, clientUserMessageId });
+
+  it("publishes async questions and sends a trusted reply through Desktop exactly once", async () => {
+    const desktop = new FakeDesktop(); desktop.conversation = asyncConversation();
+    const { ws, messages, bridge } = await inputClient(desktop);
+    ws.send(JSON.stringify({ type: "user-input.list", threadId: "thread-1", requestId: "list" }));
+    await waitFor(() => messages.some(m => m.type === "user-input.snapshot"));
+    expect(messages.find(m => m.requestId === "list")).toMatchObject({ requests: [{ id: asyncId, questions: [{ id: asyncQuestionId, allowFreeform: true, options: [{ label: "A" }, { label: "B" }] }] }] });
+    ws.send(JSON.stringify({ ...answerMessage(), question: "untrusted override" }));
+    ws.send(JSON.stringify(answerMessage()));
+    await waitFor(() => messages.some(m => m.type === "user-input.submitted"));
+    expect(desktop.calls).toHaveLength(1);
+    expect(desktop.calls[0]).toMatchObject({ method: "steer", params: { input: [{ type: "text", text: '<send_user_message_question_reply>\n[{"questionItemId":"[\\"request_user_input_async\\",\\"agent-question\\",0]","question":"Choose?","answer":"A"}]\n</send_user_message_question_reply>' }] } });
+    expect(bridge.calls.some(c => c.method.startsWith("turn/"))).toBe(false);
+    expect(messages.filter(m => m.type === "user-input.snapshot").at(-1)?.requests).toEqual([]);
+  });
+
+  it("routes Desktop native requests separately and clears them when the desktop answers", async () => {
+    const desktop = new FakeDesktop(); desktop.conversation = { ...asyncConversation(), requests: [nativeRequest] };
+    const { ws, messages, bridge } = await inputClient(desktop);
+    ws.send(JSON.stringify({ type: "thread.open", threadId: "thread-1" }));
+    await waitFor(() => messages.some(m => m.type === "user-input.snapshot"));
+    ws.send(JSON.stringify(answerMessage('["tool","desktop","turn-active","number",42]', { q: ["A"] })));
+    await waitFor(() => messages.some(m => m.type === "user-input.submitted"));
+    expect(desktop.calls).toEqual([{ method: "reply", threadId: "thread-1", params: { requestId: 42, response: { answers: { q: { answers: ["A"] } } } } }]);
+    expect(bridge.responses).toEqual([]);
+    desktop.conversation = { id: "thread-1", turns: [], requests: [] }; desktop.emit("snapshot", desktop.conversation);
+    await waitFor(() => messages.filter(m => m.type === "user-input.snapshot").at(-1)?.requests instanceof Array && (messages.filter(m => m.type === "user-input.snapshot").at(-1)?.requests as unknown[]).length === 0);
+  });
+
+  it("accepts only the helper's own native callback and keeps command approvals", async () => {
+    const { ws, messages, bridge } = await inputClient();
+    ws.send(JSON.stringify({ type: "user-input.list", threadId: "thread-1" }));
+    await waitFor(() => messages.some(m => m.type === "user-input.snapshot"));
+    bridge.emit("serverRequest", nativeRequest);
+    bridge.emit("serverRequest", { id: 43, method: "item/commandExecution/requestApproval", params: { threadId: "thread-1", command: "echo hi" } });
+    await waitFor(() => messages.some(m => m.type === "approval"));
+    expect(bridge.errors).toEqual([]);
+    ws.send(JSON.stringify(answerMessage('["tool","appServer","turn-active","number",42]', { q: ["A"] })));
+    await waitFor(() => messages.some(m => m.type === "user-input.submitted"));
+    expect(bridge.responses).toEqual([{ id: 42, result: { answers: { q: { answers: ["A"] } } } }]);
+    ws.send(JSON.stringify({ type: "approval.resolve", approvalRequestId: 43, decision: "decline" }));
+    await waitFor(() => bridge.responses.length === 2);
+    expect(bridge.responses[1]).toEqual({ id: 43, result: { decision: "decline" } });
+  });
+
+  it("rejects stale IDs and invalid answers before delivery", async () => {
+    const desktop = new FakeDesktop(); desktop.conversation = asyncConversation();
+    const { ws, messages } = await inputClient(desktop);
+    ws.send(JSON.stringify({ type: "user-input.list", threadId: "thread-1" }));
+    await waitFor(() => messages.some(m => m.type === "user-input.snapshot"));
+    ws.send(JSON.stringify(answerMessage(asyncId, { unknown: ["A"] }, "invalid")));
+    await waitFor(() => messages.some(m => m.type === "error" && m.requestId === "invalid"));
+    desktop.conversation = { id: "thread-1", turns: [] }; desktop.emit("snapshot", desktop.conversation);
+    ws.send(JSON.stringify(answerMessage(asyncId, undefined, "stale")));
+    await waitFor(() => messages.some(m => m.type === "error" && m.requestId === "stale"));
+    expect(desktop.calls).toEqual([]);
+  });
+
+  it("rechecks the owner and pending request after durable reservation", async () => {
+    for (const race of ["owner", "answered"]) {
+      const desktop = new FakeDesktop(); desktop.conversation = asyncConversation();
+      const ledger = { reserve: async () => { if (race === "owner") desktop.identity = "replacement"; else desktop.conversation = { id: "thread-1", turns: [] }; } } as unknown as SubmissionLedger;
+      const { ws, messages } = await inputClient(desktop, ledger);
+      ws.send(JSON.stringify({ type: "user-input.list", threadId: "thread-1" }));
+      await waitFor(() => messages.some(m => m.type === "user-input.snapshot"));
+      ws.send(JSON.stringify(answerMessage()));
+      await waitFor(() => messages.some(m => m.type === "error" && m.requestId === "answer-1"));
+      expect(desktop.calls).toEqual([]);
+    }
+  });
+
+  it("never retries an uncertain question submission with a fresh message ID", async () => {
+    const desktop = new FakeDesktop(); desktop.conversation = asyncConversation(); desktop.steerError = new Error("Desktop IPC connection closed");
+    const { ws, messages, bridge } = await inputClient(desktop);
+    ws.send(JSON.stringify({ type: "user-input.list", threadId: "thread-1" }));
+    await waitFor(() => messages.some(m => m.type === "user-input.snapshot"));
+    ws.send(JSON.stringify(answerMessage()));
+    await waitFor(() => messages.some(m => m.type === "error" && m.requestId === "answer-1"));
+    ws.send(JSON.stringify(answerMessage(asyncId, undefined, "answer-2")));
+    await waitFor(() => messages.some(m => m.type === "error" && m.requestId === "answer-2"));
+    expect(desktop.calls).toHaveLength(1);
+    expect(messages.find(m => m.requestId === "answer-1" && m.type === "error")?.code).toBe("submission_state_unknown");
+    expect(bridge.calls.some(c => c.method.startsWith("turn/"))).toBe(false);
+  });
+
+  it("only starts an async reply after Desktop explicitly reports an inactive turn", async () => {
+    const desktop = new FakeDesktop(); desktop.conversation = asyncConversation(); desktop.steerError = new Error("SteerTurnInactiveError");
+    const { ws, messages } = await inputClient(desktop);
+    ws.send(JSON.stringify({ type: "user-input.list", threadId: "thread-1" }));
+    await waitFor(() => messages.some(m => m.type === "user-input.snapshot"));
+    ws.send(JSON.stringify(answerMessage()));
+    await waitFor(() => messages.some(m => m.type === "user-input.submitted"));
+    expect(desktop.calls.map(c => c.method)).toEqual(["steer", "start"]);
+  });
+
+  it("reserves an authoritative input once across concurrent device message IDs", async () => {
+    const desktop = new FakeDesktop(); desktop.conversation = asyncConversation();
+    let release!: () => void;
+    const disk = new Promise<void>(resolve => { release = resolve; });
+    let reservations = 0;
+    const ledger = { reserve: async () => { reservations += 1; await disk; }, reserveBatch: async () => ({ release: async () => {} }) } as unknown as SubmissionLedger;
+    const { ws, messages } = await inputClient(desktop, ledger);
+    ws.send(JSON.stringify({ type: "user-input.list", threadId: "thread-1" }));
+    await waitFor(() => messages.some(m => m.type === "user-input.snapshot"));
+    ws.send(JSON.stringify(answerMessage()));
+    ws.send(JSON.stringify(answerMessage(asyncId, undefined, "other-device-answer")));
+    await waitFor(() => reservations === 2);
+    release();
+    await waitFor(() => messages.filter(m => m.type === "user-input.submitted").length === 2);
+    expect(desktop.calls).toHaveLength(1);
+    expect(reservations).toBe(3); // two message IDs plus the one authoritative input
+  });
+
+  it("rejects an old native form when Desktop reuses its RPC ID in a later turn", async () => {
+    const desktop = new FakeDesktop();
+    desktop.conversation = { ...asyncConversation(), requests: [nativeRequest] };
+    const { ws, messages } = await inputClient(desktop);
+    ws.send(JSON.stringify({ type: "user-input.list", threadId: "thread-1" }));
+    await waitFor(() => messages.some(m => m.type === "user-input.snapshot"));
+    const oldInput = (messages.find(m => m.type === "user-input.snapshot")!.requests as Array<{ id: string; kind: string }>).find(input => input.kind === "tool")!;
+    desktop.conversation = { id: "thread-1", turns: [], requests: [{ ...nativeRequest, params: { ...nativeRequest.params, turnId: "turn-later" } }] };
+    desktop.emit("snapshot", desktop.conversation);
+    ws.send(JSON.stringify({ type: "user-input.list", threadId: "thread-1", requestId: "later-turn" }));
+    await waitFor(() => messages.some(m => m.requestId === "later-turn"));
+    const newInput = (messages.find(m => m.requestId === "later-turn")!.requests as Array<{ id: string }>)[0]!;
+    expect(newInput.id).not.toBe(oldInput.id);
+    ws.send(JSON.stringify(answerMessage(oldInput.id, { q: ["A"] }, "old-native-form")));
+    await waitFor(() => messages.some(m => m.type === "error" && m.requestId === "old-native-form"));
+    expect(messages.find(m => m.requestId === "old-native-form")?.code).toBe("user_input_stale");
+    expect(desktop.calls).toEqual([]);
+    ws.send(JSON.stringify(answerMessage(newInput.id, { q: ["A"] }, "new-native-form")));
+    await waitFor(() => messages.some(m => m.type === "user-input.submitted" && m.requestId === "new-native-form"));
+    expect(desktop.calls).toEqual([{ method: "reply", threadId: "thread-1", params: { requestId: 42, response: { answers: { q: { answers: ["A"] } } } } }]);
+  });
+
+  it("allows remaining async questions after Desktop partially answers during durable reservation", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "cmr-partial-input-ledger-"));
+    closers.unshift(async () => { await rm(directory, { recursive: true, force: true }); });
+    const durable = await SubmissionLedger.create(join(directory, "submissions.json"));
+    const desktop = new FakeDesktop();
+    const conversation = asyncConversation();
+    conversation.turns[0]!.items[0]!.questions.push({ title: "Second?", options: ["Yes", "No"] });
+    desktop.conversation = conversation;
+    let reservations = 0;
+    const ledger = { reserve: async (key: string, fingerprint: string) => {
+      await durable.reserve(key, fingerprint);
+      reservations += 1;
+      if (reservations === 2) {
+        const reply = '<send_user_message_question_reply>\n[{"questionItemId":"[\\"request_user_input_async\\",\\"agent-question\\",0]","question":"Choose?","answer":"A"}]\n</send_user_message_question_reply>';
+        desktop.conversation = { ...conversation, turns: [{ ...conversation.turns[0], items: [...conversation.turns[0]!.items, { type: "userMessage", content: [{ type: "text", text: reply }] }] }] };
+        desktop.emit("snapshot", desktop.conversation);
+      }
+    }, reserveBatch: durable.reserveBatch.bind(durable) } as unknown as SubmissionLedger;
+    const { ws, messages } = await inputClient(desktop, ledger);
+    ws.send(JSON.stringify({ type: "user-input.list", threadId: "thread-1" }));
+    await waitFor(() => messages.some(m => m.type === "user-input.snapshot"));
+    const oldInput = (messages.find(m => m.type === "user-input.snapshot")!.requests as Array<{ id: string }>)[0]!;
+    const secondQuestionId = '["request_user_input_async","agent-question",1]';
+    ws.send(JSON.stringify(answerMessage(oldInput.id, { [asyncQuestionId]: ["A"], [secondQuestionId]: ["Yes"] }, "full-answer")));
+    await waitFor(() => messages.some(m => m.type === "error" && m.requestId === "full-answer"));
+    expect(messages.find(m => m.requestId === "full-answer")?.code).toBe("user_input_stale");
+    expect(desktop.calls).toEqual([]);
+    ws.send(JSON.stringify({ type: "user-input.list", threadId: "thread-1", requestId: "remaining" }));
+    await waitFor(() => messages.some(m => m.requestId === "remaining"));
+    const remaining = (messages.find(m => m.requestId === "remaining")!.requests as Array<{ id: string; questions: Array<{ id: string }> }>)[0]!;
+    expect(remaining.questions.map(question => question.id)).toEqual([secondQuestionId]);
+    expect(remaining.id).not.toBe(oldInput.id);
+    ws.send(JSON.stringify(answerMessage(remaining.id, { [secondQuestionId]: ["Yes"] }, "remaining-answer")));
+    await waitFor(() => messages.some(m => m.type === "user-input.submitted" && m.requestId === "remaining-answer"));
+    expect(desktop.calls).toHaveLength(1);
+    expect(desktop.calls[0]).toMatchObject({ method: "steer", params: { input: [{ type: "text", text: '<send_user_message_question_reply>\n[{"questionItemId":"[\\"request_user_input_async\\",\\"agent-question\\",1]","question":"Second?","answer":"Yes"}]\n</send_user_message_question_reply>' }] } });
+  });
+
+  it("never resends an attempted question after an uncertain group answer and partial Desktop reply, including restart", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "cmr-attempted-input-ledger-"));
+    closers.unshift(async () => { await rm(directory, { recursive: true, force: true }); });
+    const filename = join(directory, "submissions.json");
+    const desktop = new FakeDesktop();
+    const conversation = asyncConversation();
+    conversation.turns[0]!.items[0]!.questions.push({ title: "Second?", options: ["Yes", "No"] });
+    desktop.conversation = conversation;
+    desktop.steerError = new Error("Desktop IPC request timed out: thread-follower-steer-turn");
+    const first = await inputClient(desktop, await SubmissionLedger.create(filename));
+    first.ws.send(JSON.stringify({ type: "user-input.list", threadId: "thread-1" }));
+    await waitFor(() => first.messages.some(m => m.type === "user-input.snapshot"));
+    const full = (first.messages.find(m => m.type === "user-input.snapshot")!.requests as Array<{ id: string }>)[0]!;
+    const secondQuestionId = '["request_user_input_async","agent-question",1]';
+    first.ws.send(JSON.stringify(answerMessage(full.id, { [asyncQuestionId]: ["A"], [secondQuestionId]: ["Yes"] }, "uncertain-full")));
+    await waitFor(() => first.messages.some(m => m.type === "error" && m.requestId === "uncertain-full"));
+    expect(first.messages.find(m => m.requestId === "uncertain-full")?.code).toBe("submission_state_unknown");
+    expect(desktop.calls).toHaveLength(1);
+    const reply = '<send_user_message_question_reply>\n[{"questionItemId":"[\\"request_user_input_async\\",\\"agent-question\\",0]","question":"Choose?","answer":"A"}]\n</send_user_message_question_reply>';
+    desktop.conversation = { ...conversation, turns: [{ ...conversation.turns[0], items: [...conversation.turns[0]!.items, { type: "userMessage", content: [{ type: "text", text: reply }] }] }] };
+    desktop.steerError = null; desktop.emit("snapshot", desktop.conversation);
+    first.ws.send(JSON.stringify({ type: "user-input.list", threadId: "thread-1", requestId: "partial-remaining" }));
+    await waitFor(() => first.messages.some(m => m.requestId === "partial-remaining"));
+    const remaining = (first.messages.find(m => m.requestId === "partial-remaining")!.requests as Array<{ id: string }>)[0]!;
+    expect(remaining.id).not.toBe(full.id);
+    first.ws.send(JSON.stringify(answerMessage(remaining.id, { [secondQuestionId]: ["Yes"] }, "overlap-live")));
+    await waitFor(() => first.messages.some(m => m.requestId === "overlap-live"));
+    expect(first.messages.find(m => m.requestId === "overlap-live")).toMatchObject({ type: "error", code: "submission_state_unknown" });
+    const restarted = await inputClient(desktop, await SubmissionLedger.create(filename));
+    restarted.ws.send(JSON.stringify({ type: "user-input.list", threadId: "thread-1" }));
+    await waitFor(() => restarted.messages.some(m => m.type === "user-input.snapshot"));
+    restarted.ws.send(JSON.stringify(answerMessage(remaining.id, { [secondQuestionId]: ["Yes"] }, "overlap-restarted")));
+    await waitFor(() => restarted.messages.some(m => m.requestId === "overlap-restarted"));
+    expect(restarted.messages.find(m => m.requestId === "overlap-restarted")).toMatchObject({ type: "error", code: "submission_state_unknown" });
+    expect(desktop.calls).toHaveLength(1);
+  });
+
+  it("releases question reservations only when final preflight aborts before delivery, including restart", async () => {
+    for (const restart of [false, true]) {
+      const directory = await mkdtemp(join(tmpdir(), "cmr-final-preflight-input-"));
+      closers.unshift(async () => { await rm(directory, { recursive: true, force: true }); });
+      const filename = join(directory, "submissions.json");
+      const durable = await SubmissionLedger.create(filename);
+      const desktop = new FakeDesktop();
+      const conversation = asyncConversation();
+      conversation.turns[0]!.items[0]!.questions.push({ title: "Second?", options: ["Yes", "No"] });
+      desktop.conversation = conversation;
+      let reservedQuestions = false;
+      const ledger = { reserve: durable.reserve.bind(durable), reserveBatch: async (keys: readonly string[], fingerprint: string) => {
+        const reservation = await durable.reserveBatch(keys, fingerprint);
+        if (!reservedQuestions) {
+          reservedQuestions = true;
+          const reply = '<send_user_message_question_reply>\n[{"questionItemId":"[\\"request_user_input_async\\",\\"agent-question\\",0]","question":"Choose?","answer":"A"}]\n</send_user_message_question_reply>';
+          desktop.conversation = { ...conversation, turns: [{ ...conversation.turns[0], items: [...conversation.turns[0]!.items, { type: "userMessage", content: [{ type: "text", text: reply }] }] }] };
+          desktop.emit("snapshot", desktop.conversation);
+        }
+        return reservation;
+      } } as unknown as SubmissionLedger;
+      const first = await inputClient(desktop, ledger);
+      first.ws.send(JSON.stringify({ type: "user-input.list", threadId: "thread-1" }));
+      await waitFor(() => first.messages.some(m => m.type === "user-input.snapshot"));
+      const full = (first.messages.find(m => m.type === "user-input.snapshot")!.requests as Array<{ id: string }>)[0]!;
+      const secondQuestionId = '["request_user_input_async","agent-question",1]';
+      first.ws.send(JSON.stringify(answerMessage(full.id, { [asyncQuestionId]: ["A"], [secondQuestionId]: ["Yes"] }, "late-preflight-full")));
+      await waitFor(() => first.messages.some(m => m.type === "error" && m.requestId === "late-preflight-full"));
+      expect(first.messages.find(m => m.requestId === "late-preflight-full")?.code).toBe("user_input_stale");
+      expect(desktop.calls).toEqual([]);
+      const next = restart ? await inputClient(desktop, await SubmissionLedger.create(filename)) : first;
+      next.ws.send(JSON.stringify({ type: "user-input.list", threadId: "thread-1", requestId: "after-proven-abort" }));
+      await waitFor(() => next.messages.some(m => m.requestId === "after-proven-abort"));
+      const remaining = (next.messages.find(m => m.requestId === "after-proven-abort")!.requests as Array<{ id: string }>)[0]!;
+      next.ws.send(JSON.stringify(answerMessage(remaining.id, { [secondQuestionId]: ["Yes"] }, "safe-remaining-after-abort")));
+      await waitFor(() => next.messages.some(m => m.type === "user-input.submitted" && m.requestId === "safe-remaining-after-abort"));
+      expect(desktop.calls).toHaveLength(1);
+    }
+  });
+
+  it("does not consume a fresh question when another question in its new group already had an uncertain delivery", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "cmr-overlapping-question-group-"));
+    closers.unshift(async () => { await rm(directory, { recursive: true, force: true }); });
+    const desktop = new FakeDesktop();
+    const conversation = asyncConversation();
+    conversation.turns[0]!.items[0]!.questions.push({ title: "Second?", options: ["Yes", "No"] });
+    desktop.conversation = conversation; desktop.steerError = new Error("Desktop IPC request timed out");
+    const { ws, messages } = await inputClient(desktop, await SubmissionLedger.create(join(directory, "submissions.json")));
+    ws.send(JSON.stringify({ type: "user-input.list", threadId: "thread-1" }));
+    await waitFor(() => messages.some(m => m.type === "user-input.snapshot"));
+    const full = (messages.find(m => m.type === "user-input.snapshot")!.requests as Array<{ id: string }>)[0]!;
+    const q2 = '["request_user_input_async","agent-question",1]', q3 = '["request_user_input_async","agent-question",2]';
+    ws.send(JSON.stringify(answerMessage(full.id, { [asyncQuestionId]: ["A"], [q2]: ["Yes"] }, "attempt-q1-q2")));
+    await waitFor(() => messages.some(m => m.type === "error" && m.requestId === "attempt-q1-q2"));
+    conversation.turns[0]!.items[0]!.questions.push({ title: "Third?", options: ["Go", "Stop"] });
+    const replyItem = (questionId: string) => ({ type: "userMessage", content: [{ type: "text", text: `<send_user_message_question_reply>\n${JSON.stringify([{ questionItemId: questionId, question: "Desktop answer", answer: "accepted" }])}\n</send_user_message_question_reply>` }] });
+    desktop.conversation = { ...conversation, turns: [{ ...conversation.turns[0], items: [...conversation.turns[0]!.items, replyItem(asyncQuestionId)] }] };
+    desktop.steerError = null;
+    ws.send(JSON.stringify({ type: "user-input.list", threadId: "thread-1", requestId: "q2-q3" }));
+    await waitFor(() => messages.some(m => m.requestId === "q2-q3"));
+    const overlap = (messages.find(m => m.requestId === "q2-q3")!.requests as Array<{ id: string }>)[0]!;
+    ws.send(JSON.stringify(answerMessage(overlap.id, { [q2]: ["Yes"], [q3]: ["Go"] }, "blocked-q2-q3")));
+    await waitFor(() => messages.some(m => m.requestId === "blocked-q2-q3"));
+    expect(messages.find(m => m.requestId === "blocked-q2-q3")).toMatchObject({ type: "error", code: "submission_state_unknown" });
+    desktop.conversation = { ...conversation, turns: [{ ...conversation.turns[0], items: [...conversation.turns[0]!.items, replyItem(asyncQuestionId), replyItem(q2)] }] };
+    ws.send(JSON.stringify({ type: "user-input.list", threadId: "thread-1", requestId: "q3-only" }));
+    await waitFor(() => messages.some(m => m.requestId === "q3-only"));
+    const fresh = (messages.find(m => m.requestId === "q3-only")!.requests as Array<{ id: string }>)[0]!;
+    ws.send(JSON.stringify(answerMessage(fresh.id, { [q3]: ["Go"] }, "fresh-q3")));
+    await waitFor(() => messages.some(m => m.type === "user-input.submitted" && m.requestId === "fresh-q3"));
+    expect(desktop.calls).toHaveLength(2);
+  });
+
+  it("retains durable per-input protection after restart even with a new message ID", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "cmr-input-ledger-"));
+    closers.unshift(async () => { await rm(directory, { recursive: true, force: true }); });
+    const filename = join(directory, "submissions.json");
+    const desktop = new FakeDesktop(); desktop.conversation = asyncConversation();
+    const first = await inputClient(desktop, await SubmissionLedger.create(filename));
+    first.ws.send(JSON.stringify({ type: "user-input.list", threadId: "thread-1" }));
+    await waitFor(() => first.messages.some(m => m.type === "user-input.snapshot"));
+    first.ws.send(JSON.stringify(answerMessage()));
+    await waitFor(() => first.messages.some(m => m.type === "user-input.submitted"));
+    const second = await inputClient(desktop, await SubmissionLedger.create(filename));
+    second.ws.send(JSON.stringify({ type: "user-input.list", threadId: "thread-1" }));
+    await waitFor(() => second.messages.some(m => m.type === "user-input.snapshot"));
+    second.ws.send(JSON.stringify(answerMessage(asyncId, undefined, "after-restart")));
+    await waitFor(() => second.messages.some(m => m.type === "error" && m.requestId === "after-restart"));
+    expect(second.messages.find(m => m.type === "error" && m.requestId === "after-restart")?.code).toBe("submission_state_unknown");
+    expect(desktop.calls).toHaveLength(1);
+  });
+
+  it("clears forms on Desktop disconnection and refuses helper fallback", async () => {
+    const desktop = new FakeDesktop(); desktop.conversation = asyncConversation();
+    const { ws, messages, bridge } = await inputClient(desktop);
+    ws.send(JSON.stringify({ type: "user-input.list", threadId: "thread-1" }));
+    await waitFor(() => messages.some(m => m.type === "user-input.snapshot"));
+    desktop.ready = false; desktop.emit("offline");
+    await waitFor(() => messages.filter(m => m.type === "user-input.snapshot").at(-1)?.requests instanceof Array && (messages.filter(m => m.type === "user-input.snapshot").at(-1)?.requests as unknown[]).length === 0);
+    ws.send(JSON.stringify(answerMessage()));
+    await waitFor(() => messages.some(m => m.type === "error" && m.requestId === "answer-1"));
+    expect(desktop.calls).toEqual([]);
+    expect(bridge.calls.some(c => c.method.startsWith("turn/"))).toBe(false);
+  });
+
+  it("expires a helper native callback on serverRequest/resolved without answering it", async () => {
+    const { ws, messages, bridge } = await inputClient();
+    ws.send(JSON.stringify({ type: "user-input.list", threadId: "thread-1" }));
+    await waitFor(() => messages.some(m => m.type === "user-input.snapshot"));
+    bridge.emit("serverRequest", nativeRequest);
+    await waitFor(() => (messages.filter(m => m.type === "user-input.snapshot").at(-1)?.requests as unknown[])?.length === 1);
+    bridge.emit("notification", { method: "serverRequest/resolved", params: { requestId: 42 } });
+    await waitFor(() => (messages.filter(m => m.type === "user-input.snapshot").at(-1)?.requests as unknown[])?.length === 0);
+    ws.send(JSON.stringify(answerMessage('["tool","appServer","turn-active","number",42]', { q: ["A"] })));
+    await waitFor(() => messages.some(m => m.type === "error" && m.requestId === "answer-1"));
+    expect(bridge.responses).toEqual([]);
+  });
+
+  it("does not expire a newer turn's native question when an older turn completes", async () => {
+    const { ws, messages, bridge } = await inputClient();
+    ws.send(JSON.stringify({ type: "user-input.list", threadId: "thread-1" }));
+    await waitFor(() => messages.some(m => m.type === "user-input.snapshot"));
+    bridge.emit("serverRequest", nativeRequest);
+    bridge.emit("notification", { method: "turn/completed", params: { threadId: "thread-1", turn: { id: "turn-older", status: "completed" } } });
+    ws.send(JSON.stringify({ type: "user-input.list", requestId: "after-old-turn", threadId: "thread-1" }));
+    await waitFor(() => messages.some(m => m.requestId === "after-old-turn"));
+    expect(messages.find(m => m.requestId === "after-old-turn")?.requests).toMatchObject([{ turnId: "turn-active" }]);
+  });
+
+
+  it("reconnects with a fresh authoritative input snapshot without replaying older forms", async () => {
+    const { ws, messages, bridge } = await inputClient();
+    await waitFor(() => messages.some(m => m.type === "welcome"));
+    const welcome = messages.find(m => m.type === "welcome")!;
+    ws.send(JSON.stringify({ type: "user-input.list", threadId: "thread-1" }));
+    await waitFor(() => messages.some(m => m.type === "user-input.snapshot"));
+    bridge.emit("serverRequest", nativeRequest);
+    await waitFor(() => (messages.filter(m => m.type === "user-input.snapshot").at(-1)?.requests as unknown[])?.length === 1);
+    bridge.emit("notification", { method: "serverRequest/resolved", params: { requestId: 42 } });
+    await waitFor(() => (messages.filter(m => m.type === "user-input.snapshot").at(-1)?.requests as unknown[])?.length === 0);
+    messages.splice(0);
+    ws.send(JSON.stringify({ type: "sync.resume", requestId: "reconnect", syncVersion: welcome.syncVersion, cursor: welcome.latestCursor, threadIds: ["thread-1"] }));
+    await waitFor(() => messages.some(m => m.type === "sync.replay"));
+    const replay = messages.find(m => m.type === "sync.replay")!;
+    expect((replay.events as Array<{ type: string }>).some(m => m.type === "user-input.snapshot")).toBe(false);
+    await waitFor(() => messages.some(m => m.type === "user-input.snapshot"));
+    expect(messages.find(m => m.type === "user-input.snapshot")?.requests).toEqual([]);
+  });
   it("authenticates and sends thread data", async () => {
     const { bridge, port } = await start();
     const encoded = Buffer.from(token).toString("base64url");

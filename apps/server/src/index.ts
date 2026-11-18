@@ -6,6 +6,8 @@ import { DesktopIpcBridge } from "./desktop-ipc-bridge.js";
 import { FileTransferError, FileTransferManager } from "./file-transfer.js";
 import { MobileGateway } from "./gateway.js";
 import { PromptQueueStore } from "./prompt-queue.js";
+import { dirname, join } from 'node:path';
+import { SubmissionLedger } from './submission-ledger.js';
 
 const config = loadConfig();
 const bridge = new AppServerBridge({
@@ -21,7 +23,8 @@ const desktopIpc = new DesktopIpcBridge(
 const promptQueue = await PromptQueueStore.create(config.promptQueueFile);
 const files = await FileTransferManager.create({ allowedRoots: config.fileRoots, uploadDirectory: config.uploadDirectory });
 await files.cleanupOrphanedUploads(promptQueue.protectedFilePaths());
-const gateway = new MobileGateway(bridge, config, desktopIpc, files, promptQueue);
+const submissionLedger = await SubmissionLedger.create(join(dirname(config.promptQueueFile),'submissions.json'));
+const gateway = new MobileGateway(bridge, config, desktopIpc, files, promptQueue, submissionLedger);
 const heartbeat = gateway.startHeartbeat();
 const fileCleanup = setInterval(() => void Promise.all([files.cleanupExpired(), files.cleanupOrphanedUploads(promptQueue.protectedFilePaths())]).catch((error) => console.warn("[files] cleanup", error)), 60_000);
 fileCleanup.unref();

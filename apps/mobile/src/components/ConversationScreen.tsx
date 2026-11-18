@@ -11,12 +11,17 @@ import { GitDiffPanel } from './GitDiffPanel';
 import { PromptQueuePanel } from './PromptQueuePanel';
 import { TransientActivity } from './TransientActivity';
 import { ElapsedTime } from './ElapsedTime';
+import type {UserInputRequest} from '../types/protocol';
+import {UserQuestionCard} from './QuestionCard';
 
 interface ConversationScreenProps {
   thread: RemoteThread;
   messages: RemoteMessage[];
   subagents: RemoteThread[];
   approvals: ApprovalRequest[];
+  userInputs?:UserInputRequest[];
+  userInputsReady?:boolean;
+  onAnswerUserInput?:(request:UserInputRequest,answers:Record<string,string[]>)=>Promise<boolean>;
   compaction: CompactionStatus | null;
   promptQueue: PromptQueueItem[];
   gitDiff: GitDiffSnapshot | null;
@@ -308,7 +313,7 @@ export function visibleConversationContentKey(
   return `${entryKey}::${approvalKey}`;
 }
 
-export function ConversationScreen({ thread, messages, subagents: threadSubagents, approvals, compaction, promptQueue, gitDiff, models, skills, selectedModel, selectedEffort, selectedPermissionMode, permissionModeStatus, phase, phaseDetail, running, canInterrupt, currentTurnId, historyHasMore, historyLoading, selectedAgentId, onSelectAgent, onBack, onLoadOlderHistory, onReconnect, onSend, onCancelQueuedPrompt, onPromoteQueuedPrompt, onResumePromptQueue, onRefreshGitDiff, onInterrupt, onSelectModel, onSelectEffort, onSelectPermissionMode, onResolveApproval, onDismissCompaction, onOpenThread, onLoadAttachment, onDownloadAttachment }: ConversationScreenProps) {
+export function ConversationScreen({ thread, messages, subagents: threadSubagents, approvals, userInputs=[],userInputsReady=false,onAnswerUserInput,compaction, promptQueue, gitDiff, models, skills, selectedModel, selectedEffort, selectedPermissionMode, permissionModeStatus, phase, phaseDetail, running, canInterrupt, currentTurnId, historyHasMore, historyLoading, selectedAgentId, onSelectAgent, onBack, onLoadOlderHistory, onReconnect, onSend, onCancelQueuedPrompt, onPromoteQueuedPrompt, onResumePromptQueue, onRefreshGitDiff, onInterrupt, onSelectModel, onSelectEffort, onSelectPermissionMode, onResolveApproval, onDismissCompaction, onOpenThread, onLoadAttachment, onDownloadAttachment }: ConversationScreenProps) {
   const streamRef = useRef<HTMLElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
   const followingRef = useRef(true);
@@ -372,8 +377,8 @@ export function ConversationScreen({ thread, messages, subagents: threadSubagent
   const selectedAgent = subagents.find((agent) => agent.id === selectedAgentId) ?? null;
 
   const contentKey = useMemo(
-    () => visibleConversationContentKey(renderedWindow.entries, expandedToolGroupIds, approvals),
-    [approvals, expandedToolGroupIds, renderedWindow.entries],
+    () => visibleConversationContentKey(renderedWindow.entries, expandedToolGroupIds, approvals)+'::questions:'+JSON.stringify(userInputs),
+    [approvals, expandedToolGroupIds, renderedWindow.entries,userInputs],
   );
 
   useLayoutEffect(() => {
@@ -639,6 +644,7 @@ export function ConversationScreen({ thread, messages, subagents: threadSubagent
               </details>
             ))}
             {approvals.map((approval) => <ApprovalCard key={approval.id} approval={approval} permissionMode={selectedPermissionMode} onResolve={onResolveApproval} />)}
+            {onAnswerUserInput&&userInputs.map(request=><UserQuestionCard key={request.id} request={request} connected={userInputsReady&&phase==='connected'} onAnswer={onAnswerUserInput} />)}
           </div>
         </section>
         {hasNewContent && (

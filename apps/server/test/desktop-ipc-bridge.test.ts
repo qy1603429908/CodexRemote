@@ -19,6 +19,13 @@ async function waitUntil(predicate: () => boolean, timeoutMs = 2_000): Promise<v
 }
 
 describe("Desktop IPC approval forwarding", () => {
+  it("forwards native user input through the original follower owner", async () => {
+    const bridge = new DesktopIpcBridge(false);
+    const calls: unknown[] = [];
+    (bridge as unknown as { requestFollower: (...args: unknown[]) => Promise<unknown> }).requestFollower = async (...args) => { calls.push(args); return { ok: true }; };
+    await bridge.replyUserInput("thread-1", 42, { answers: { q: { answers: ["A"] } } });
+    expect(calls).toEqual([["thread-1", "thread-follower-submit-user-input", { conversationId: "thread-1", requestId: 42, response: { answers: { q: { answers: ["A"] } } } }]]);
+  });
   it("forwards native Computer Use elicitation responses with the Desktop follower payload", async () => {
     const bridge = new DesktopIpcBridge(false);
     const calls: Array<{ conversationId: string; method: string; params: Record<string, unknown> }> = [];

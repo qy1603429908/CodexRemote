@@ -1,7 +1,20 @@
 import { describe, expect, it } from "vitest";
-import { cacheScope, clearRemoteCache, compactCache, loadRemoteCache, messagesForThread, type RemoteCacheSnapshot } from "../src/lib/remoteCache";
+import { cacheScope, clearRemoteCache, compactCache, loadRemoteCache, messagesForThread, sanitizeRemoteCache, type RemoteCacheSnapshot } from "../src/lib/remoteCache";
 
 describe("remote cache", () => {
+  it("migrates older cached question replies without discarding attachments, identity or surrounding text", () => {
+    const reply = { questionItemId: '["request_user_input_async","call",0]', question: "请选择", answer: "my_answer" };
+    const raw = { id: "reply", threadId: "thread", turnId: "old-turn", role: "user" as const,
+      content: `补充说明\n<send_user_message_question_reply>${JSON.stringify([reply])}</send_user_message_question_reply>`,
+      createdAt: 1, status: "complete" as const, attachments: [{ type: "image" as const, name: "test.png", path: "D:/test.png", mimeType: "image/png" }] };
+    const snapshot: RemoteCacheSnapshot = { schema: 4, savedAt: 1, syncCursor: 3, threadIndexVersion: 2,
+      selectedThreadId: "thread", threads: [], messagesByThread: { thread: [raw] }, historyByThread: {} };
+    const migrated = sanitizeRemoteCache(snapshot);
+    expect(migrated.messagesByThread.thread).toEqual([{ ...raw, content: "补充说明", questionReplies: [reply] }]);
+    expect(sanitizeRemoteCache(migrated)).toEqual(migrated);
+    expect(raw.content).toContain("send_user_message_question_reply");
+  });
+
   it("does not persist streaming reasoning summaries as durable conversation history", () => {
     const reasoning = {
       id: "reason", threadId: "thread", turnId: "turn", role: "system" as const, content: "数小时前的旧梗概",

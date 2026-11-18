@@ -1,4 +1,5 @@
 import type { RemoteMessage, RemoteThread } from '../types/protocol';
+import { parseQuestionReply } from './userInput';
 
 export interface CachedHistoryState {
   nextCursor: string | null;
@@ -43,7 +44,11 @@ export function messagesForThread(threadId: string, messages: RemoteMessage[]): 
 
 export function sanitizeMessagesByThread(messagesByThread: Record<string, RemoteMessage[]>): Record<string, RemoteMessage[]> {
   return Object.fromEntries(
-    Object.entries(messagesByThread).map(([threadId, messages]) => [threadId, messagesForThread(threadId, messages)]),
+    Object.entries(messagesByThread).map(([threadId, messages]) => [threadId, messagesForThread(threadId, messages).map(message => {
+      if (message.role !== 'user' || message.questionReplies) return message;
+      const reply = parseQuestionReply(message.content);
+      return reply ? { ...message, content: reply.content, questionReplies: reply.replies } : message;
+    })]),
   );
 }
 

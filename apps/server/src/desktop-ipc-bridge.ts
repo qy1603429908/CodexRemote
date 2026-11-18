@@ -109,6 +109,16 @@ export function isWindowsNamedPipeEndpoint(value: string): boolean {
   return /^[A-Za-z0-9._-]+$/.test(value.slice(prefix.length));
 }
 
+// The stdio API permits omitted text elements; the Desktop's optimistic renderer
+// and steering helpers require an array before app-server normalization runs.
+function desktopInput(value: unknown): unknown[] {
+  return Array.isArray(value) ? value.map(item => {
+    const input = record(item);
+    return input?.type === "text" && !Array.isArray(input.text_elements)
+      ? { ...input, text_elements: [] } : item;
+  }) : [];
+}
+
 /**
  * Adapter for the desktop GUI's local Codex IPC router.
  *
@@ -129,6 +139,8 @@ export class DesktopIpcBridge extends EventEmitter {
   private readonly follows = new Map<string, FollowTarget>();
   private readonly conversations = new Map<string, DesktopConversation>();
   private readonly revisions = new Map<string, number>();
+  // Retain this knowledge across resets: losing an owner is not proof of idle.
+  private readonly desktopOwnedIds = new Set<string>();
   private readonly refreshTimers = new Map<string, NodeJS.Timeout>();
   private readonly followWaiters = new Map<
     string,
@@ -190,6 +202,15 @@ export class DesktopIpcBridge extends EventEmitter {
     return Boolean(this.follows.get(id)?.ownerClientId);
   }
 
+  controlIdentity(id: string): string | null {
+    const owner = this.follows.get(id)?.ownerClientId;
+    return this.ready && owner ? JSON.stringify([this.connectionGeneration, owner]) : null;
+  }
+
+  isControlStateUncertain(id: string): boolean {
+    return this.desktopOwnedIds.has(id) && (!this.ready || !this.hasOwner(id) || !this.conversations.has(id));
+  }
+
   async openConversation(
     conversationId: string,
     hostId = "local",
@@ -237,6 +258,7 @@ export class DesktopIpcBridge extends EventEmitter {
         conversationId,
         turnStartParams: {
           ...turnStartParams,
+          input: desktopInput(turnStartParams.input),
           clientUserMessageId:
             typeof turnStartParams.clientUserMessageId === "string"
               ? turnStartParams.clientUserMessageId
@@ -256,9 +278,7 @@ export class DesktopIpcBridge extends EventEmitter {
       typeof turnStartParams.clientUserMessageId === "string"
         ? turnStartParams.clientUserMessageId
         : randomUUID();
-    const input = Array.isArray(turnStartParams.input)
-      ? turnStartParams.input
-      : [];
+    const input = desktopInput(turnStartParams.input);
     const text = input
       .map((value) => {
         const item = record(value);
@@ -279,6 +299,7 @@ export class DesktopIpcBridge extends EventEmitter {
         fileAttachments: [],
         ideContext: null,
         imageAttachments: [],
+        commentAttachments: [],
         workspaceRoots: cwd ? [cwd] : [],
       },
       cwd,
@@ -388,6 +409,14 @@ export class DesktopIpcBridge extends EventEmitter {
       return;
     }
     throw new Error(`Unsupported Desktop IPC approval method: ${method}`);
+  }
+
+  async replyUserInput(
+    conversationId: string,
+    requestId: string | number,
+    response: { answers: Record<string, { answers: string[] }> },
+  ): Promise<void> {
+    await this.requestFollower(conversationId, "thread-follower-submit-user-input", { conversationId, requestId, response });
   }
 
   private async followConversation(
@@ -686,6 +715,7 @@ export class DesktopIpcBridge extends EventEmitter {
       const hostId = stringField(frame.params.hostId) ?? "local";
       if (!conversationId || frame.sourceClientId === this.clientId) return;
       if (frame.params.following === true) {
+        this.desktopOwnedIds.add(conversationId);
         this.follows.set(conversationId, {
           ...(this.follows.get(conversationId) ?? { conversationId, hostId }),
           conversationId,
@@ -741,6 +771,7 @@ export class DesktopIpcBridge extends EventEmitter {
           return;
         }
         existingTarget.ownerClientId = frame.sourceClientId;
+        this.desktopOwnedIds.add(conversationId);
         this.follows.set(conversationId, existingTarget);
         const normalized = normalizeDesktopConversation(
           conversationId,

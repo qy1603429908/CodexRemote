@@ -11,6 +11,7 @@ import {
   type ServerMessage,
   type SkillOption,
   type ThreadSummary,
+  type UserInputRequest,
 } from "@codex-mobile/protocol";
 import { authenticateUpgrade, selectedProtocol } from "./auth.js";
 import type { ServerConfig } from "./config.js";
@@ -27,6 +28,8 @@ import type { FileTransferManager } from "./file-transfer.js";
 import { GitDiffError, readGitDiff, type GitDiffSnapshot } from "./git-diff.js";
 import { PromptQueueStore, type StoredPromptQueueItem } from "./prompt-queue.js";
 import { SyncJournal, ThreadIndexStore } from "./sync-state.js";
+import { SubmissionLedger, SubmissionLedgerError } from './submission-ledger.js';
+import { asyncUserInputs, nativeUserInput, questionReplyText, validateUserInputAnswers } from "./user-input.js";
 
 const MAX_WS_BUFFERED_BYTES = 8 * 1024 * 1024;
 
@@ -86,6 +89,9 @@ export class MobileGateway {
   private readonly desktopApprovalKeys = new Set<number | string>();
   private readonly turnDiffs = new Map<string, string>();
   private readonly desktopThreads = new Map<string, Record<string, unknown>>();
+  private readonly nativeInputs = new Map<string, RpcEnvelope>();
+  private readonly submittedInputs = new Set<string>();
+  private readonly attemptedInputQuestions = new Set<string>();
   private readonly threadCwds = new Map<string, string>();
   private readonly failedAuth = new Map<
     string,
@@ -109,6 +115,7 @@ export class MobileGateway {
     private readonly desktopIpc?: DesktopIpcBridge,
     private readonly files?: FileTransferManager,
     private readonly promptQueue?: PromptQueueStore,
+    private readonly submissionLedger?: SubmissionLedger,
   ) {
     this.wss = new WebSocketServer({
       noServer: true,
@@ -120,6 +127,9 @@ export class MobileGateway {
       this.broadcast({ type: "status", codexReady: true });
     });
     bridge.on("offline", (error: Error) => {
+      const inputThreads = new Set([...this.nativeInputs.values()].map(input => String(input.params?.threadId ?? "")));
+      this.nativeInputs.clear();
+      for (const threadId of inputThreads) this.broadcastUserInputs(threadId);
       for (const [requestId, approval] of this.approvals) {
         if (approval.params?._desktopOrigin === true) continue;
         this.approvals.delete(requestId);
@@ -182,6 +192,7 @@ export class MobileGateway {
         ) {
           const turn = asRecord(params.turn);
           this.clearAppServerApprovals(params.threadId);
+          this.clearNativeInputs(params.threadId, { turnId: typeof turn?.id === "string" ? turn.id : typeof turn?.turnId === "string" ? turn.turnId : undefined });
           if (typeof turn?.id === "string") this.turnDiffs.delete(turnKey(params.threadId, turn.id));
           this.rememberAppServerCompletedTurn(params.threadId, turn);
           const completedStatus = String(turn?.status ?? params.status ?? "").toLowerCase();
@@ -207,12 +218,18 @@ export class MobileGateway {
                 : undefined;
           const turnId = typeof params.turnId === "string" ? params.turnId : undefined;
           this.clearAppServerApprovals(params.threadId, { turnId, itemId });
+          this.clearNativeInputs(params.threadId, { turnId, itemId });
         }
         if (
           message.method === "serverRequest/resolved" &&
           (typeof params?.requestId === "string" ||
             typeof params?.requestId === "number")
         ) {
+          for (const [key, input] of this.nativeInputs) {
+            if (input.id !== params.requestId) continue;
+            this.nativeInputs.delete(key);
+            this.broadcastUserInputs(String(input.params?.threadId ?? ""));
+          }
           if (this.approvals.delete(params.requestId))
             this.broadcast({
               type: "approval.resolved",
@@ -254,6 +271,7 @@ export class MobileGateway {
       if (typeof thread.cwd === "string" && isAbsoluteHostPath(thread.cwd)) this.threadCwds.set(id, thread.cwd);
       this.upsertThreadSummary({ ...toThreadSummary(thread), status: this.mergedThreadStatus(id, thread.threadRuntimeStatus ?? thread.status) });
       this.syncDesktopApprovals(id, thread);
+      this.broadcastUserInputs(id);
       const liveThread = projectDesktopLiveThread(this.projectThreadRuntimeStatus(thread));
       void this.trustDesktopAttachments(liveThread).then(() => {
         if (this.desktopThreads.get(id) !== thread) return;
@@ -278,6 +296,7 @@ export class MobileGateway {
     desktopIpc?.on("reset", () => this.clearDesktopState());
     desktopIpc?.on("ownerLost", (threadId: string) => {
       this.desktopThreads.delete(threadId);
+      this.broadcastUserInputs(threadId);
       this.desktopQueuedFollowUps.delete(threadId);
       this.clearDesktopApprovalsForThread(threadId);
       const change = this.threadIndex.remove(threadId);
@@ -324,7 +343,10 @@ export class MobileGateway {
     socket: WebSocket,
     threadId: string,
   ): Promise<void> {
-    if (!this.desktopIpc?.ready) return;
+    if (!this.desktopIpc?.ready) {
+      this.sendUserInputs(socket, threadId);
+      return;
+    }
     try {
       const thread = await this.desktopIpc.openConversation(
         threadId,
@@ -332,8 +354,12 @@ export class MobileGateway {
         2_500,
         false,
       );
-      if (!thread || !this.desktopIpc.hasOwner(threadId)) return;
+      if (!thread || !this.desktopIpc.hasOwner(threadId)) {
+        this.sendUserInputs(socket, threadId);
+        return;
+      }
       this.desktopThreads.set(threadId, thread);
+      this.sendUserInputs(socket, threadId);
       const liveThread = projectDesktopLiveThread(
         this.projectThreadRuntimeStatus(thread),
       );
@@ -363,9 +389,11 @@ export class MobileGateway {
   }
 
   private clearDesktopState(): void {
+    const inputThreads = [...this.desktopThreads.keys()];
     for (const threadId of this.desktopThreads.keys())
       this.threadIndex.remove(threadId);
     this.desktopThreads.clear();
+    for (const threadId of inputThreads) this.broadcastThread(threadId, { type: "user-input.snapshot", threadId, requests: [] });
     this.desktopQueuedFollowUps.clear();
     for (const wireId of [...this.desktopApprovalKeys]) {
       this.desktopApprovalKeys.delete(wireId);
@@ -507,6 +535,20 @@ export class MobileGateway {
         case "ping":
           this.send(socket, { type: "pong", id: message.id });
           break;
+        case "user-input.list": {
+          const threadId = requiredString(message.threadId, "threadId");
+          this.socketThreads.get(socket)?.add(threadId);
+          if (this.desktopIpc?.ready) {
+            const thread = await this.desktopIpc.openConversation(threadId, "local", 2_500, false);
+            if (thread && this.desktopIpc.hasOwner(threadId)) this.desktopThreads.set(threadId, thread);
+          }
+          this.sendUserInputs(socket, threadId, message.requestId);
+          break;
+        }
+        case "user-input.answer": {
+          await this.answerUserInput(socket, message);
+          break;
+        }
         case "sync.resume": {
           const afterCursor = typeof message.cursor === "number" ? message.cursor : undefined;
           const threadIds = Array.isArray(message.threadIds)
@@ -1103,6 +1145,7 @@ export class MobileGateway {
     clientUserMessageId: string | undefined,
     fingerprint: string,
     submit: () => Promise<unknown>,
+    durable = false,
   ): Promise<unknown> {
     if (!clientUserMessageId) return submit();
     this.pruneTurnSubmissions();
@@ -1117,7 +1160,14 @@ export class MobileGateway {
       }
       return existing.promise;
     }
-    const promise = Promise.resolve().then(submit);
+    const promise = Promise.resolve().then(async()=>{
+      try { if (durable) await this.submissionLedger?.reserve(key, fingerprint); }
+      catch(error) {
+        if(error instanceof SubmissionLedgerError)throw new GatewayRequestError(error.code,error.message);
+        throw error;
+      }
+      return submit();
+    });
     this.turnSubmissions.set(key, {
       fingerprint,
       createdAt: Date.now(),
@@ -1295,6 +1345,8 @@ export class MobileGateway {
       thread: { thread },
       history: page.history,
     });
+    if (desktopThread) this.syncDesktopApprovals(threadId, desktopThread);
+    this.sendUserInputs(socket, threadId);
     this.scheduleQueueDrain(threadId);
   }
 
@@ -1380,6 +1432,151 @@ export class MobileGateway {
     return cwd;
   }
 
+  private inputKey(threadId: string, inputId: string): string {
+    return JSON.stringify([threadId, inputId]);
+  }
+
+  private submittedInputKey(input: UserInputRequest): string {
+    return JSON.stringify([input.threadId, input.turnId, input.id]);
+  }
+
+  private desktopNativeInput(threadId: string, value: unknown): { request: RpcEnvelope; input: UserInputRequest } | null {
+    const raw = asRecord(value);
+    if (!raw || (typeof raw.id !== "string" && typeof raw.id !== "number") || typeof raw.method !== "string") return null;
+    const request = { id: raw.id, method: raw.method, params: { ...(asRecord(raw.params) ?? {}), threadId } };
+    const input = nativeUserInput(threadId, request, "desktop");
+    return input ? { request, input } : null;
+  }
+
+  private pendingUserInputs(threadId: string): UserInputRequest[] {
+    let requests: UserInputRequest[] = [];
+    if (this.desktopIpc?.ready && this.desktopIpc.hasOwner(threadId)) {
+      const thread = this.desktopIpc.getConversation(threadId);
+      if (!thread) return [];
+      requests = asyncUserInputs(threadId, thread);
+      for (const value of Array.isArray(thread.requests) ? thread.requests : []) {
+        const native = this.desktopNativeInput(threadId, value);
+        if (native) requests.push(native.input);
+      }
+    } else if (!this.desktopIpc?.isControlStateUncertain?.(threadId) && this.bridge.ready) {
+      for (const pending of this.nativeInputs.values()) {
+        if (pending.params?.threadId !== threadId) continue;
+        const input = nativeUserInput(threadId, pending, "appServer");
+        if (input) requests.push(input);
+      }
+    }
+    return requests.filter(input => !this.submittedInputs.has(this.submittedInputKey(input)));
+  }
+
+  private sendUserInputs(socket: WebSocket, threadId: string, requestId?: string): void {
+    this.send(socket, { type: "user-input.snapshot", requestId, threadId, requests: this.pendingUserInputs(threadId) });
+  }
+
+  private broadcastUserInputs(threadId: string): void {
+    this.broadcastThread(threadId, { type: "user-input.snapshot", threadId, requests: this.pendingUserInputs(threadId) });
+  }
+
+  private clearNativeInputs(threadId: string, match: { turnId?: string; itemId?: string } = {}): void {
+    for (const [key, pending] of this.nativeInputs) {
+      const params = pending.params;
+      if (params?.threadId !== threadId || (match.turnId && params.turnId !== match.turnId) || (match.itemId && params.itemId !== match.itemId)) continue;
+      this.nativeInputs.delete(key);
+    }
+    this.broadcastUserInputs(threadId);
+  }
+
+  private async reserveInputQuestions(input: UserInputRequest): Promise<() => Promise<void>> {
+    const keys = input.questions.map(question => JSON.stringify([
+      "user-input-question", input.threadId, input.turnId, input.kind,
+      input.kind === "tool" ? input.id : null, question.id,
+    ]));
+    if (keys.some(key => this.attemptedInputQuestions.has(key)))
+      throw new GatewayRequestError("submission_state_unknown", "此问题已有投递尝试；请核查历史，系统不会因问题分组变化而重复回答。");
+    for (const key of keys) this.attemptedInputQuestions.add(key);
+    let reservation;
+    try { reservation = await this.submissionLedger?.reserveBatch(keys, "user-input-question-attempt-v1"); }
+    catch (error) {
+      for (const key of keys) this.attemptedInputQuestions.delete(key);
+      if (error instanceof SubmissionLedgerError) throw new GatewayRequestError(error.code, error.message);
+      throw error;
+    }
+    return async () => {
+      // Called only if final preflight fails before any delivery API was invoked.
+      // A failed release keeps in-memory protection as well as the durable entry.
+      await reservation?.release();
+      for (const key of keys) this.attemptedInputQuestions.delete(key);
+    };
+  }
+
+  private async answerUserInput(socket: WebSocket, message: Extract<ClientMessage, { type: "user-input.answer" }>): Promise<void> {
+    const threadId = requiredString(message.threadId, "threadId");
+    const inputId = requiredString(message.inputId, "inputId");
+    const clientUserMessageId = requiredString(message.clientUserMessageId, "clientUserMessageId");
+    const input = this.pendingUserInputs(threadId).find(input => input.id === inputId);
+    if (!input) throw new GatewayRequestError("user_input_stale", "问题已被回答或已过期，请刷新会话。");
+    let answers: Record<string, string[]>;
+    try { answers = validateUserInputAnswers(input.questions, message.answers); }
+    catch (error) { throw new GatewayRequestError("invalid_user_input", error instanceof Error ? error.message : "Invalid answers."); }
+    const desktopOwned = this.desktopIpc?.ready === true && this.desktopIpc.hasOwner(threadId);
+    const owner = desktopOwned ? this.desktopIpc!.controlIdentity(threadId) : null;
+    const native = this.nativeInputs.get(this.inputKey(threadId, inputId));
+    const assertPending = () => {
+      if (desktopOwned) {
+        if (!owner || this.desktopIpc?.controlIdentity(threadId) !== owner)
+          throw new GatewayRequestError("submission_state_unknown", "Desktop owner 已变化，已停止投递；请刷新会话确认。");
+      } else if (!this.bridge.ready || this.desktopIpc?.hasOwner(threadId) || this.desktopIpc?.isControlStateUncertain?.(threadId) || this.nativeInputs.get(this.inputKey(threadId, inputId)) !== native) {
+        throw new GatewayRequestError("submission_state_unknown", "原始问答请求的归属已变化，已停止投递。");
+      }
+      const current = this.pendingUserInputs(threadId).find(candidate => candidate.id === inputId);
+      if (!current || JSON.stringify(current) !== JSON.stringify(input)) throw new GatewayRequestError("user_input_stale", "问题已被回答或已过期，请刷新会话。");
+    };
+    const fingerprint = JSON.stringify({ input, answers });
+    await this.submitTurnIdempotently(threadId, clientUserMessageId, fingerprint, () =>
+      this.submitTurnIdempotently(threadId, `user-input:${input.turnId}:${inputId}`, fingerprint, async () => {
+        assertPending();
+        const releaseQuestions = await this.reserveInputQuestions(input);
+        let deliveryAttempted = false;
+        try {
+          // Question reservation also yields to disk; authority can change here.
+          assertPending();
+          if (input.kind === "tool") {
+            const response = { answers: Object.fromEntries(Object.entries(answers).map(([id, values]) => [id, { answers: values }])) };
+            if (desktopOwned) {
+              const thread = this.desktopIpc!.getConversation(threadId);
+              const native = (thread?.requests ?? []).map(value => this.desktopNativeInput(threadId, value)).find(native => native?.input.id === inputId);
+              if (!native) throw new GatewayRequestError("user_input_stale", "原生问题已不再待答。");
+              deliveryAttempted = true;
+              await this.desktopIpc!.replyUserInput(threadId, native.request.id, response);
+            } else {
+              if (!native) throw new GatewayRequestError("user_input_stale", "原生问题已不再待答。");
+              deliveryAttempted = true;
+              this.bridge.respond(native.id, response);
+              this.nativeInputs.delete(this.inputKey(threadId, inputId));
+            }
+          } else {
+            if (!desktopOwned) throw new GatewayRequestError("submission_state_unknown", "异步问题的 Desktop owner 尚未恢复。");
+            const params = { threadId, input: [{ type: "text", text: questionReplyText(input.questions, answers) }], clientUserMessageId };
+            deliveryAttempted = true;
+            try { await this.desktopIpc!.steerTurn(threadId, params); }
+            catch (error) {
+              if (!isExplicitInactiveSteerError(error)) throw error;
+              assertPending();
+              await this.desktopIpc!.startTurn(threadId, params);
+            }
+          }
+        } catch (error) {
+          if (!deliveryAttempted) await releaseQuestions();
+          if (isUncertainDesktopSubmissionError(error)) throw new GatewayRequestError("submission_state_unknown", "回答结果未获确认；请刷新历史确认，系统不会自动重发。");
+          throw error;
+        }
+        this.submittedInputs.add(this.submittedInputKey(input));
+        this.broadcastUserInputs(threadId);
+      }, true),
+      true,
+    );
+    this.send(socket, { type: "user-input.submitted", requestId: message.requestId, threadId, inputId });
+  }
+
   private syncDesktopApprovals(
     threadId: string,
     thread: Record<string, unknown>,
@@ -1432,6 +1629,17 @@ export class MobileGateway {
   }
 
   private onServerRequest(message: RpcEnvelope): void {
+    if (message.method === "item/tool/requestUserInput") {
+      const threadId = typeof message.params?.threadId === "string" ? message.params.threadId : "";
+      // A mirrored callback is never authority to answer Desktop's original request.
+      if (!threadId || this.desktopIpc?.hasOwner(threadId) || this.desktopIpc?.isControlStateUncertain?.(threadId)) return;
+      const input = nativeUserInput(threadId, message, "appServer");
+      if (input) {
+        this.nativeInputs.set(this.inputKey(threadId, input.id), message);
+        this.broadcastUserInputs(threadId);
+      }
+      return;
+    }
     if (!isApprovalMethod(message.method)) {
       this.bridge.respondError(
         message.id,
@@ -1527,10 +1735,11 @@ export class MobileGateway {
         socket.readyState === WebSocket.OPEN &&
         this.socketThreads.get(socket)?.has(threadId),
     );
-    const isDesktopSnapshot =
+    const isAuthoritativeSnapshot = message.type === "user-input.snapshot" || (
       message.type === "event" &&
-      message.method === "desktop/threadSnapshot";
-    if (isDesktopSnapshot) {
+      message.method === "desktop/threadSnapshot");
+    // Pending forms describe current authority and must never become stale replay events.
+    if (isAuthoritativeSnapshot) {
       if (sockets.length === 0) return;
       const payload = JSON.stringify(message);
       for (const socket of sockets) this.sendPayload(socket, payload);

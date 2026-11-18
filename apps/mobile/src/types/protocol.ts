@@ -1,5 +1,14 @@
 export const WIRE_PROTOCOL = 'codex-mobile-v1' as const;
 
+export interface UserInputOption {label:string;description?:string;}
+export interface UserInputQuestion {
+  id:string;title:string;header?:string;options:UserInputOption[];allowFreeform:boolean;isSecret?:boolean;multiSelect?:boolean;
+}
+export interface UserInputRequest {
+  id:string;threadId:string;turnId:string;kind:'async'|'tool';questions:UserInputQuestion[];
+}
+export interface QuestionReply {questionItemId:string;question:string;answer:string;}
+
 export type ApprovalDecision =
   | "accept"
   | "acceptForSession"
@@ -102,6 +111,8 @@ export interface WireApprovalRequest {
 }
 
 export type ClientMessage =
+  | { type:'user-input.list';requestId?:string;threadId:string }
+  | { type:'user-input.answer';requestId:string;threadId:string;inputId:string;answers:Record<string,string[]>;clientUserMessageId:string }
   | { type: "ping"; id?: string }
   | { type: "threads.list"; requestId?: string; limit?: number }
   | { type: "threads.sync"; requestId?: string; knownVersion?: number }
@@ -138,6 +149,8 @@ export type ClientMessage =
   | { type: "approval.resolve"; requestId?: string; approvalRequestId: number | string; decision: ApprovalDecision };
 
 export type ServerMessagePayload =
+  | { type:'user-input.snapshot';requestId?:string;threadId:string;requests:UserInputRequest[] }
+  | { type:'user-input.submitted';requestId?:string;threadId:string;inputId:string }
   | { type: "welcome"; version: string; serverId: string; codexReady: boolean; syncVersion?: string; latestCursor?: number; threadIndexVersion?: number }
   | { type: "pong"; id?: string }
   | { type: "sync.replay"; requestId?: string; syncVersion: string; fromCursor: number; toCursor: number; events: ServerMessage[] }
@@ -223,6 +236,7 @@ export interface RemoteMessage {
   turnId?: string;
   role: MessageRole;
   content: string;
+  questionReplies?: QuestionReply[];
   attachments?: RemoteAttachment[];
   createdAt: number;
   /** Provenance for createdAt. Turn timestamps are ordering-only and must not be rendered as item times. */

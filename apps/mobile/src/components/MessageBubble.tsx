@@ -2,6 +2,7 @@ import { memo, useEffect, useState } from 'react';
 import type { RemoteAttachment, RemoteMessage } from '../types/protocol';
 import { DiffView } from './DiffView';
 import { Markdown } from './Markdown';
+import {HistoryQuestionReply} from './QuestionCard';
 
 export function displayTime(timestamp: number, source?: RemoteMessage['timestampSource']): string {
   if (!source || source === 'turn' || !timestamp || timestamp <= 0) return '';
@@ -135,6 +136,7 @@ export function messageBubblePropsEqual(previous: MessageBubbleProps, next: Mess
     && left.completedAt === right.completedAt && left.durationMs === right.durationMs
     && left.itemType === right.itemType && left.toolName === right.toolName
     && left.collapsible === right.collapsible && left.detail === right.detail
+    && JSON.stringify(left.questionReplies) === JSON.stringify(right.questionReplies)
     && sameAttachments(left.attachments, right.attachments)
   );
   return messageEqual && sameAgentTargets(previous.agentTargets, next.agentTargets)
@@ -164,11 +166,12 @@ export const MessageBubble = memo(function MessageBubble({ message, agentTargets
     ? (agentTargets.length > 0 ? '' : '查看 Subagent 活动')
     : (firstLine(message.content) || '查看详情');
   const body = () => <>
-    {isDiff
+    {message.questionReplies?.length ? <HistoryQuestionReply replies={message.questionReplies} /> : null}
+    {message.content ? isDiff
       ? <DiffView diff={message.content} />
       : isTool
         ? <pre><code>{message.content}</code></pre>
-        : <Markdown content={message.content} />}
+        : <Markdown content={message.content} /> : null}
     <AttachmentGallery message={message} onLoad={onLoadAttachment} onDownload={onDownloadAttachment} />
   </>;
 

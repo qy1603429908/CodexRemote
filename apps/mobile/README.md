@@ -27,6 +27,10 @@ Android 原生前台服务提供后台运行基础，审批使用 High 渠道，
 - `/download <电脑绝对路径>` 创建短 TTL、默认一次性的下载票据；Android 10+ 原生插件写入公共 Downloads；Android 7–9 写入 App 专用 Downloads 并返回 FileProvider URI。
 - 权限选择对应 Desktop 的 `auto`、`granular`、`read-only`、`guardian-approvals`、`full-access` 预设。协议证据见 `../../docs/file-transfer.md`。
 
+### Agent 提问
+
+待答问题显示为选项/输入卡片，可直接在手机回答；已回答记录显示问题与答案。Bridge 和 App 需要一起更新。断线时草稿保留，取得新的待答状态后才能提交；结果未知时先核对历史，不自动重发。协议、去重及验证边界见 [Agent 主动提问](../../docs/user-input-questions.md)。
+
 ## 安全存储
 
 - 服务器地址保存在 Capacitor Preferences。

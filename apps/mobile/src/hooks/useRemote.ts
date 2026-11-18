@@ -2,6 +2,7 @@ import { App as CapacitorApp } from '@capacitor/app';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { RemoteConfig } from '../lib/configStore';
 import { RemoteSocket } from '../lib/RemoteSocket';
+import {parseQuestionReply} from '../lib/userInput';
 import { cancelApprovalNotification, cancelThreadAttentionNotification, notifyApprovalRequested, notifyCompactionFailed, notifyThreadAttention, notifyTurnFinished } from '../lib/notifications';
 import { downloadHostFile, saveHostFile, uploadRemoteFile } from '../lib/fileTransfer';
 import { NotificationGenerationGuard, NotificationOperationQueue, settleGuardedNotification } from '../lib/notificationGuard';
@@ -24,6 +25,7 @@ import type {
   PermissionMode,
   ThreadSummary,
   WireApprovalRequest,
+  UserInputRequest,
 } from '../types/protocol';
 import { createRequestId } from '../types/protocol';
 
@@ -408,7 +410,9 @@ export function itemToMessage(itemValue: unknown, threadId: string, turnId: stri
     collapsible = role === 'tool';
   }
 
-  if (!content && attachments.length === 0) return null;
+  const questionReply=role==='user'?parseQuestionReply(content):null;
+  if(questionReply)content=questionReply.content;
+  if (!content && attachments.length === 0 && !questionReply) return null;
   if (!content && attachments.length > 0) content = attachments.every((attachment) => attachment.type === 'image')
     ? `发送了 ${attachments.length} 张图片`
     : `发送了 ${attachments.length} 个附件`;
@@ -420,6 +424,7 @@ export function itemToMessage(itemValue: unknown, threadId: string, turnId: stri
     turnId,
     role,
     content,
+    ...(questionReply?{questionReplies:questionReply.replies}:{}),
     ...(attachments.length ? { attachments } : {}),
     createdAt: itemCreatedAt ?? fallbackCreatedAt,
     timestampSource: itemCreatedAt != null ? 'item' : 'turn',
@@ -485,13 +490,13 @@ function preserveFresherLiveMessage(current: RemoteMessage | undefined, incoming
   // Reasoning summaries are replaceable activity labels, not append-only answer text.
   // A newer Desktop snapshot may legitimately replace a long old summary with a short
   // current one, so content length must never decide which reasoning text wins.
-  const currentHasLongerContent = !incomingType.includes('reasoning') && current.content.length > incoming.content.length;
+  const currentHasLongerContent = !incoming.questionReplies && !incomingType.includes('reasoning') && current.content.length > incoming.content.length;
   const preventsTerminalDowngrade = current.status !== 'streaming' && incoming.status === 'streaming';
   if (!currentHasLongerContent && !preventsTerminalDowngrade && !preserveObservedTimestamp) return incoming;
   return {
     ...incoming,
     ...(preserveObservedTimestamp ? { createdAt: current.createdAt, timestampSource: current.timestampSource } : {}),
-    ...((currentHasLongerContent || preventsTerminalDowngrade)
+    ...((currentHasLongerContent || preventsTerminalDowngrade) && !incoming.questionReplies
       ? { content: current.content, detail: current.detail ?? incoming.detail }
       : {}),
     ...(preventsTerminalDowngrade ? { status: current.status } : {}),
@@ -557,6 +562,7 @@ function sameRemoteMessage(left: RemoteMessage, right: RemoteMessage): boolean {
     && left.turnId === right.turnId
     && left.role === right.role
     && left.content === right.content
+    && sameJsonLikeValue(left.questionReplies,right.questionReplies)
     && left.createdAt === right.createdAt
     && left.completedAt === right.completedAt
     && left.durationMs === right.durationMs
@@ -1063,6 +1069,14 @@ export function useRemote(config: RemoteConfig | null) {
   const [codexReady, setCodexReady] = useState(false);
   const [models, setModels] = useState<ModelOption[]>([]);
   const [skills, setSkills] = useState<SkillOption[]>([]);
+  const [userInputsByThread,setUserInputsByThread]=useState<Record<string,UserInputRequest[]>>({});
+  const userInputsRef=useRef<Record<string,UserInputRequest[]>>({});
+  const [inputFreshByThread,setInputFreshByThread]=useState<Record<string,boolean>>({});
+  const inputFreshRef=useRef<Record<string,boolean>>({});
+  const freshInputQueriesRef=useRef(new Map<string,string>());
+  const answeredInputIdsRef=useRef(new Set<string>());
+  const inputSubmissionIdsRef=useRef(new Map<string,{id:string;payload:string}>());
+  const pendingInputAnswersRef=useRef(new Map<string,{resolve:(value:boolean)=>void;timer:number;threadId:string;inputId:string}>());
   const [selectedModel, setSelectedModelState] = useState('');
   const [selectedEffort, setSelectedEffortState] = useState('');
   const [selectedPermissionMode, setSelectedPermissionModeState] = useState<PermissionMode>('auto');
@@ -1090,6 +1104,17 @@ export function useRemote(config: RemoteConfig | null) {
   const [historyByThread, setHistoryByThread] = useState<Record<string, CachedHistoryState>>({});
   const [historyLoadingByThread, setHistoryLoadingByThread] = useState<Record<string, boolean>>({});
   const historyByThreadRef = useRef<Record<string, CachedHistoryState>>({});
+
+  const refreshUserInputs=useCallback((threadId:string)=>{
+    const requestId=createRequestId('questions');
+    freshInputQueriesRef.current.set(requestId,threadId);
+    if(!socketRef.current?.send({type:'user-input.list',requestId,threadId}))freshInputQueriesRef.current.delete(requestId);
+  },[]);
+  const invalidateInputConnection=useCallback(()=>{
+    inputFreshRef.current={};setInputFreshByThread({});freshInputQueriesRef.current.clear();
+    for(const pending of pendingInputAnswersRef.current.values()){window.clearTimeout(pending.timer);pending.resolve(false);}
+    pendingInputAnswersRef.current.clear();
+  },[]);
 
   const setSelectedPermissionMode = useCallback((mode: PermissionMode) => {
     selectedPermissionModeRef.current = mode;
@@ -1796,6 +1821,7 @@ export function useRemote(config: RemoteConfig | null) {
               historyLimit: 20, knownTurnIds: knownTurnIds(messagesForThread(selected, messagesByThreadRef.current[selected] ?? [])),
             });
             socketRef.current?.send({ type: 'thread.diff.get', requestId: createRequestId('diff'), threadId: selected });
+            refreshUserInputs(selected);
           }
           break;
         }
@@ -1843,6 +1869,24 @@ export function useRemote(config: RemoteConfig | null) {
             const defaultModel = message.models.find((model) => model.isDefault) ?? message.models[0];
             return defaultModel?.defaultReasoningEffort ?? '';
           });
+          break;
+        }
+        case 'user-input.snapshot': {
+          const requests=message.requests.filter(request=>!answeredInputIdsRef.current.has(`${request.threadId}:${request.id}`));
+          userInputsRef.current={...userInputsRef.current,[message.threadId]:requests};
+          setUserInputsByThread(userInputsRef.current);
+          if(message.requestId&&freshInputQueriesRef.current.get(message.requestId)===message.threadId){
+            freshInputQueriesRef.current.delete(message.requestId);
+            inputFreshRef.current={...inputFreshRef.current,[message.threadId]:true};setInputFreshByThread(inputFreshRef.current);
+          }
+          break;
+        }
+        case 'user-input.submitted': {
+          answeredInputIdsRef.current.add(`${message.threadId}:${message.inputId}`);
+          userInputsRef.current={...userInputsRef.current,[message.threadId]:(userInputsRef.current[message.threadId]??[]).filter(request=>request.id!==message.inputId)};
+          setUserInputsByThread(userInputsRef.current);
+          const pending=message.requestId?pendingInputAnswersRef.current.get(message.requestId):undefined;
+          if(pending&&message.requestId){window.clearTimeout(pending.timer);pendingInputAnswersRef.current.delete(message.requestId);pending.resolve(true);}
           break;
         }
         case 'skills':
@@ -2025,6 +2069,15 @@ export function useRemote(config: RemoteConfig | null) {
           break;
         }
         case 'error': {
+          const answer=message.requestId?pendingInputAnswersRef.current.get(message.requestId):undefined;
+          if(answer&&message.requestId){
+            window.clearTimeout(answer.timer);pendingInputAnswersRef.current.delete(message.requestId);answer.resolve(false);
+            // This validation error is guaranteed to precede durable reservation or delivery.
+            // Unknown/stale outcomes keep their idempotency record and must not be retried as new answers.
+            if(message.code==='invalid_user_input')inputSubmissionIdsRef.current.delete(`${answer.threadId}:${answer.inputId}`);
+            refreshUserInputs(answer.threadId);
+          }
+          if(message.requestId)freshInputQueriesRef.current.delete(message.requestId);
           const permissionSetting = message.requestId ? pendingPermissionSettingsRef.current.get(message.requestId) : undefined;
           if (message.requestId) pendingPermissionSettingsRef.current.delete(message.requestId);
           if (permissionSetting) {
@@ -2049,7 +2102,7 @@ export function useRemote(config: RemoteConfig | null) {
       }
       if (typeof message.syncCursor === 'number') syncCursorRef.current = Math.max(syncCursorRef.current, message.syncCursor);
     },
-    [applyPermissionModeSnapshot, clearThreadAttentionNotification, handleEvent, observeCompactionSnapshot, replaceThreadsAndSyncAttention, reportCompactionFailure, setSelectedPermissionMode, showPermissionModeStatus, updateAttentionNotification, updateCompactionStatus, updateThreadState],
+    [applyPermissionModeSnapshot, clearThreadAttentionNotification, handleEvent, observeCompactionSnapshot, replaceThreadsAndSyncAttention, reportCompactionFailure, setSelectedPermissionMode, showPermissionModeStatus, updateAttentionNotification, updateCompactionStatus, updateThreadState,refreshUserInputs],
   );
   handleMessageRef.current = handleMessage;
 
@@ -2068,6 +2121,8 @@ export function useRemote(config: RemoteConfig | null) {
 
     setModels([]);
     setSkills([]);
+    setUserInputsByThread({});userInputsRef.current={};invalidateInputConnection();
+    inputSubmissionIdsRef.current.clear();answeredInputIdsRef.current.clear();
     setSelectedModelState('');
     setSelectedEffortState('');
     setSelectedPermissionMode('auto');
@@ -2133,7 +2188,7 @@ export function useRemote(config: RemoteConfig | null) {
         onPhase: (nextPhase, detail) => {
           setPhase(nextPhase);
           setPhaseDetail(detail ?? '');
-          if (nextPhase !== 'connected') setCodexReady(false);
+          if (nextPhase !== 'connected') {setCodexReady(false);invalidateInputConnection();}
         },
       });
       socketRef.current = socket;
@@ -2154,11 +2209,12 @@ export function useRemote(config: RemoteConfig | null) {
 
     return () => {
       cancelled = true;
+      invalidateInputConnection();
       socket?.disconnect();
       if (socketRef.current === socket) socketRef.current = null;
       void appListener?.remove();
     };
-  }, [config, setSelectedPermissionMode, showPermissionModeStatus, updateAttentionNotification]);
+  }, [config, setSelectedPermissionMode, showPermissionModeStatus, updateAttentionNotification,invalidateInputConnection]);
 
   useEffect(() => {
     if (!config || !cacheHydratedRef.current || !cacheScopeRef.current) return;
@@ -2207,13 +2263,36 @@ export function useRemote(config: RemoteConfig | null) {
     });
     if (!sent) setHistoryLoadingByThread((current) => ({ ...current, [threadId]: false }));
     socketRef.current?.send({ type: 'thread.diff.get', requestId: createRequestId('diff'), threadId });
+    refreshUserInputs(threadId);
     const thread = threads.find((candidate) => candidate.id === threadId);
     const override = permissionModeOverridesRef.current[threadId];
     if (override && override.expiresAt > Date.now()) setSelectedPermissionMode(override.mode);
     else setSelectedPermissionMode(thread?.permissionMode ?? 'auto');
     showPermissionModeStatus('');
     if (thread?.cwd) socketRef.current?.send({ type: 'skills.list', requestId: createRequestId('skills'), cwd: thread.cwd });
-  }, [setSelectedPermissionMode, showPermissionModeStatus, threads]);
+  }, [setSelectedPermissionMode, showPermissionModeStatus, threads,refreshUserInputs]);
+
+  const answerUserInput=useCallback((request:UserInputRequest,answers:Record<string,string[]>):Promise<boolean>=>{
+    const threadId=request.threadId,key=`${threadId}:${request.id}`;
+    if(!inputFreshRef.current[threadId]||!userInputsRef.current[threadId]?.some(value=>value.id===request.id)){
+      setLastError('问题状态尚未确认，请重新连接并刷新会话。');return Promise.resolve(false);
+    }
+    const payload=JSON.stringify(answers),previous=inputSubmissionIdsRef.current.get(key);
+    if(previous&&previous.payload!==payload){setLastError('此问题已有一次提交记录。请先核实原回答的处理结果。');return Promise.resolve(false);}
+    const submission=previous??{id:createRequestId('answer-once'),payload};
+    const requestId=createRequestId('answer');
+    return new Promise(resolve=>{
+      const timer=window.setTimeout(()=>{
+        pendingInputAnswersRef.current.delete(requestId);setLastError('回答结果未确认，未自动重发。请刷新历史核实。');resolve(false);
+      },15000);
+      pendingInputAnswersRef.current.set(requestId,{resolve,timer,threadId,inputId:request.id});
+      let sent = false;
+      try { sent=socketRef.current?.send({type:'user-input.answer',requestId,threadId,inputId:request.id,answers,clientUserMessageId:submission.id}) ?? false; }
+      catch { setLastError('连接已断开，请重新连接后核实问题状态。'); }
+      if(!sent){window.clearTimeout(timer);pendingInputAnswersRef.current.delete(requestId);resolve(false);return;}
+      inputSubmissionIdsRef.current.set(key,submission);
+    });
+  },[]);
 
   const loadOlderHistory = useCallback(() => {
     const threadId = selectedThreadRef.current;
@@ -2650,6 +2729,8 @@ export function useRemote(config: RemoteConfig | null) {
   if (!selectedMessagesSelectorRef.current) selectedMessagesSelectorRef.current = createSelectedMessagesSelector();
   const selectedMessages = selectedMessagesSelectorRef.current(selectedThreadId, messagesByThread, todoByThread);
   const selectedCompaction = selectedThreadId ? (compactionsByThread[selectedThreadId] ?? null) : null;
+  const selectedUserInputs=selectedThreadId?(userInputsByThread[selectedThreadId]??[]):[];
+  const userInputsReady=phase==='connected'&&!!selectedThreadId&&!!inputFreshByThread[selectedThreadId];
   const selectedPromptQueue = selectedThreadId ? (promptQueueByThread[selectedThreadId] ?? []) : [];
   const selectedGitDiff = selectedThreadId ? (gitDiffByThread[selectedThreadId] ?? null) : null;
   const selectedSubagents = useMemo(
@@ -2669,6 +2750,9 @@ export function useRemote(config: RemoteConfig | null) {
     codexReady,
     models,
     skills,
+    selectedUserInputs,
+    userInputsReady,
+    answerUserInput,
     selectedModel,
     selectedEffort,
     selectedPermissionMode,

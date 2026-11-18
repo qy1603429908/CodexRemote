@@ -101,8 +101,28 @@ export interface ApprovalRequest {
   raw: unknown;
 }
 
+export interface UserInputOption { label: string; description?: string }
+export interface UserInputQuestion {
+  id: string;
+  title: string;
+  header?: string;
+  options: UserInputOption[];
+  allowFreeform: boolean;
+  isSecret?: boolean;
+  multiSelect?: boolean;
+}
+export interface UserInputRequest {
+  id: string;
+  threadId: string;
+  turnId: string;
+  kind: "async" | "tool";
+  questions: UserInputQuestion[];
+}
+
 export type ClientMessage =
   | { type: "ping"; id?: string }
+  | { type: "user-input.list"; requestId?: string; threadId: string }
+  | { type: "user-input.answer"; requestId?: string; threadId: string; inputId: string; answers: Record<string, string[]>; clientUserMessageId: string }
   | { type: "threads.list"; requestId?: string; limit?: number }
   | { type: "threads.sync"; requestId?: string; knownVersion?: number }
   | { type: "sync.resume"; requestId?: string; syncVersion?: string; cursor?: number; threadIds?: string[] }
@@ -139,6 +159,8 @@ export type ClientMessage =
 
 export type ServerMessagePayload =
   | { type: "welcome"; version: string; serverId: string; codexReady: boolean; syncVersion?: string; latestCursor?: number; threadIndexVersion?: number }
+  | { type: "user-input.snapshot"; requestId?: string; threadId: string; requests: UserInputRequest[] }
+  | { type: "user-input.submitted"; requestId?: string; threadId: string; inputId: string }
   | { type: "pong"; id?: string }
   | { type: "sync.replay"; requestId?: string; syncVersion: string; fromCursor: number; toCursor: number; events: ServerMessage[] }
   | { type: "sync.reset"; requestId?: string; syncVersion: string; latestCursor: number; reason: string }

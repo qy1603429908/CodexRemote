@@ -173,6 +173,9 @@ export function App() {
           messages={remote.selectedMessages}
           subagents={remote.selectedSubagents}
           approvals={remote.selectedApprovals}
+          userInputs={remote.selectedUserInputs}
+          userInputsReady={remote.userInputsReady}
+          onAnswerUserInput={remote.answerUserInput}
           compaction={remote.selectedCompaction}
           promptQueue={remote.selectedPromptQueue}
           gitDiff={remote.selectedGitDiff}
